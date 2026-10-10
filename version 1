@@ -1,0 +1,755 @@
+
+#!/usr/bin/env python3
+"""
+Continuous Schrödinger Neural Field (CSNF)
+==========================================
+
+A one-dimensional reference implementation combining:
+
+1. Coupled complex-valued wave-field dynamics.
+2. Input encoding and density-based feature extraction.
+3. Ridge-regression readout.
+4. Physics-guided random search.
+5. Global and adaptive best-state memory.
+6. Shock detection with hysteresis.
+
+Coupled dynamics
+----------------
+    i*tau*dPsi/dt = H_Psi*Psi + J(x,t)*Phi
+    i*tau*dPhi/dt = H_Phi*Phi + conjugate(J(x,t))*Psi
+
+    H_s = -D_s*d²/dx² + V_s
+    J(x,t) = a(x)*exp(i*(theta(x) - omega*t))
+
+The fields evolve on a periodic finite-difference grid using a
+Crank-Nicolson/Cayley update. For a Hermitian Hamiltonian, the update
+preserves the joint squared norm up to floating-point error.
+
+This is a quantum-inspired numerical model, not a physical quantum
+computer simulation or a claim of quantum advantage.
+
+Dependency: NumPy
+"""
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+# ============================================================================
+# Configuration constants
+# ============================================================================
+
+TWO_PI = 2.0 * np.pi
+
+OMEGA_MAX = 3.0
+D_MIN, D_MAX = 0.05, 2.0
+
+POOL = 8
+
+ETA_NORMAL = 0.05
+ETA_SHOCK = 0.4
+
+
+# ============================================================================
+# Numerical utilities
+# ============================================================================
+
+def softplus(z):
+    """Map unconstrained values to positive coupling amplitudes."""
+    return np.logaddexp(0.0, z)
+
+
+def wrap(angle):
+    """Wrap angles into the interval [-pi, pi)."""
+    return (angle + np.pi) % TWO_PI - np.pi
+
+
+# ============================================================================
+# Periodic grid and finite-difference operator
+# ============================================================================
+
+class Grid:
+    """Periodic one-dimensional grid and discrete Laplacian."""
+
+    def __init__(self, n=32, L=TWO_PI):
+        if n < POOL or n % POOL != 0:
+            raise ValueError(
+                f"Grid size must be a multiple of POOL={POOL}."
+            )
+
+        if L <= 0:
+            raise ValueError("Domain length L must be positive.")
+
+        self.n = n
+        self.L = L
+        self.x = np.linspace(0.0, L, n, endpoint=False)
+        self.dx = L / n
+
+        # Periodic shifts construct the symmetric second-derivative matrix.
+        shift_up = np.roll(np.eye(n), 1, axis=0)
+        shift_dn = np.roll(np.eye(n), -1, axis=0)
+
+        self.lap = (
+            shift_up - 2.0 * np.eye(n) + shift_dn
+        ) / self.dx**2
+
+
+# ============================================================================
+# Learnable wave configuration
+# ============================================================================
+
+@dataclass
+class WaveConfig:
+    """
+    Parameters defining the coupled wave system.
+
+    z:
+        Unconstrained coupling values; converted to positive amplitudes
+        using softplus.
+
+    phase:
+        Spatial coupling phase, wrapped to [-pi, pi).
+
+    omega:
+        Temporal rotation frequency of the coupling phase.
+
+    D_psi, D_phi:
+        Propagation coefficients for the two fields.
+
+    V_psi, V_phi:
+        Constant potential terms.
+    """
+
+    z: np.ndarray
+    phase: np.ndarray
+    omega: float
+    D_psi: float
+    D_phi: float
+    V_psi: float = 0.0
+    V_phi: float = 0.0
+
+    def amplitude(self):
+        """Return the positive spatial coupling amplitude."""
+        return softplus(self.z)
+
+    def copy(self):
+        """Return an independent copy of this configuration."""
+        return WaveConfig(
+            self.z.copy(),
+            self.phase.copy(),
+            self.omega,
+            self.D_psi,
+            self.D_phi,
+            self.V_psi,
+            self.V_phi,
+        )
+
+
+# ============================================================================
+# Coupled wave evolution
+# ============================================================================
+
+def evolve(cfg, psi0, phi0, grid, T=1.0, steps=20, tau=1.0):
+    """
+    Evolve both complex fields to time T.
+
+    Returns
+    -------
+    psi_final, phi_final, relative_norm_error
+
+    The Hamiltonian is evaluated at each time-step midpoint. The
+    Cayley update is unitary when the assembled Hamiltonian is Hermitian.
+    """
+    if steps <= 0 or T < 0 or tau <= 0:
+        raise ValueError(
+            "Require steps > 0, T >= 0, and tau > 0."
+        )
+
+    n = grid.n
+    dt = T / steps
+    amplitude = cfg.amplitude()
+    eye = np.eye(n)
+
+    # Discrete Hamiltonians for the individual fields.
+    H_psi = -cfg.D_psi * grid.lap + cfg.V_psi * eye
+    H_phi = -cfg.D_phi * grid.lap + cfg.V_phi * eye
+
+    # Concatenate both fields into one joint state vector.
+    state = np.concatenate([psi0, phi0]).astype(complex)
+    initial_norm = np.vdot(state, state).real
+
+    for step in range(steps):
+        t_mid = (step + 0.5) * dt
+
+        # Time-dependent complex coupling between the two fields.
+        coupling = np.diag(
+            amplitude
+            * np.exp(1j * (cfg.phase - cfg.omega * t_mid))
+        )
+
+        # The conjugate-transpose block ensures Hermitian coupling.
+        H = np.block([
+            [H_psi, coupling],
+            [coupling.conj().T, H_phi],
+        ])
+
+        # Crank-Nicolson/Cayley update:
+        # (I + i*dt*H/(2*tau)) state_next
+        #     = (I - i*dt*H/(2*tau)) state.
+        lhs = np.eye(2 * n) + 0.5j * dt / tau * H
+        rhs = np.eye(2 * n) - 0.5j * dt / tau * H
+
+        state = np.linalg.solve(lhs, rhs @ state)
+
+    final_norm = np.vdot(state, state).real
+
+    norm_error = abs(final_norm - initial_norm) / max(
+        initial_norm, 1e-12
+    )
+
+    return state[:n], state[n:], norm_error
+
+
+# ============================================================================
+# Input encoding and feature extraction
+# ============================================================================
+
+def encode(u, grid, width=0.6):
+    """
+    Encode scalar input u as a periodic Gaussian packet in Phi.
+
+    Psi begins uniformly distributed across the grid. Both fields are
+    normalized jointly so their combined squared norm equals one.
+    """
+    if not 0.0 <= u <= 1.0:
+        raise ValueError("Input u must lie in [0, 1].")
+
+    if width <= 0:
+        raise ValueError("Gaussian width must be positive.")
+
+    center = grid.L * (0.25 + 0.5 * u)
+
+    # Angular distance implements periodic boundary conditions.
+    distance = np.angle(
+        np.exp(1j * (grid.x - center))
+    )
+
+    phi = np.exp(
+        -0.5 * (distance / width)**2
+    ).astype(complex)
+
+    psi = np.ones(grid.n, dtype=complex)
+
+    scale = np.sqrt(
+        np.vdot(psi, psi).real
+        + np.vdot(phi, phi).real
+    )
+
+    return psi / scale, phi / scale
+
+
+def pool(values):
+    """Average a one-dimensional array into POOL contiguous bins."""
+    if values.ndim != 1 or values.size % POOL != 0:
+        raise ValueError(
+            f"Expected a 1D array with length divisible by {POOL}."
+        )
+
+    return values.reshape(POOL, -1).mean(axis=1)
+
+
+def features(cfg, u_values, grid):
+    """
+    Build decoder features from evolved field densities.
+
+    Each feature row contains:
+        - POOL pooled Psi-density values
+        - POOL pooled Phi-density values
+        - One constant bias feature
+
+    Returns the feature matrix and the largest observed norm error.
+    """
+    rows = []
+    worst_norm_error = 0.0
+
+    for u in u_values:
+        psi0, phi0 = encode(u, grid)
+
+        psi, phi, norm_error = evolve(
+            cfg, psi0, phi0, grid
+        )
+
+        worst_norm_error = max(
+            worst_norm_error, norm_error
+        )
+
+        # Intensities are squared magnitudes of the complex fields.
+        # Pooling compresses each field into a compact feature vector.
+        row = np.concatenate([
+            pool(np.abs(psi)**2),
+            pool(np.abs(phi)**2),
+            [1.0],
+        ])
+
+        rows.append(row)
+
+    return np.asarray(rows), worst_norm_error
+
+
+# ============================================================================
+# Synthetic tasks and dataset generation
+# ============================================================================
+
+TASKS = {
+    "normal": lambda u: np.sin(TWO_PI * u),
+    "shock": lambda u: (
+        0.5 * np.cos(2 * TWO_PI * u) + 0.5
+    ),
+}
+
+
+@dataclass
+class Data:
+    """Training and validation inputs and their task-specific targets."""
+
+    u_tr: np.ndarray
+    u_va: np.ndarray
+    y_tr: dict
+    y_va: dict
+
+
+def make_data(rng, n_tr=48, n_va=24):
+    """Generate independent training and validation samples."""
+    u_tr = rng.uniform(0.0, 1.0, n_tr)
+    u_va = rng.uniform(0.0, 1.0, n_va)
+
+    return Data(
+        u_tr=u_tr,
+        u_va=u_va,
+        y_tr={name: fn(u_tr) for name, fn in TASKS.items()},
+        y_va={name: fn(u_va) for name, fn in TASKS.items()},
+    )
+
+
+# ============================================================================
+# Ridge-regression readout
+# ============================================================================
+
+def fit_readout(F, y, lam=1e-4):
+    """
+    Fit ridge-regression decoder weights.
+
+    The caller is responsible for passing training features and targets.
+    """
+    if lam < 0:
+        raise ValueError("Ridge penalty lam must be non-negative.")
+
+    regularized = F.T @ F + lam * np.eye(F.shape[1])
+    return np.linalg.solve(regularized, F.T @ y)
+
+
+@dataclass
+class Evaluation:
+    """Results for one wave configuration across the synthetic tasks."""
+
+    losses: dict
+    readouts: dict
+    norm_err: float
+    probe: np.ndarray
+
+
+def evaluate(cfg, data, grid):
+    """
+    Fit decoders on training samples and score on validation samples.
+
+    Validation targets are used to evaluate candidate configurations, not
+    to fit the ridge-regression readout weights.
+    """
+    F_tr, err_tr = features(cfg, data.u_tr, grid)
+    F_va, err_va = features(cfg, data.u_va, grid)
+
+    losses = {}
+    readouts = {}
+
+    for name in TASKS:
+        weights = fit_readout(F_tr, data.y_tr[name])
+
+        predictions = F_va @ weights
+
+        losses[name] = float(
+            np.mean((predictions - data.y_va[name])**2)
+        )
+
+        readouts[name] = weights
+
+    return Evaluation(
+        losses=losses,
+        readouts=readouts,
+        norm_err=max(err_tr, err_va),
+        probe=F_tr[0, :POOL].copy(),
+    )
+
+
+# ============================================================================
+# Physics-guided candidate generation and validation
+# ============================================================================
+
+class PhysicsEngine:
+    """Generate bounded candidate configurations and validate evolution."""
+
+    def __init__(self, grid, norm_tol=1e-6):
+        self.grid = grid
+        self.norm_tol = norm_tol
+
+    def propose(self, center, scale, rng):
+        """Perturb an incumbent configuration using the selected search scale."""
+        n = self.grid.n
+        candidate = center.copy()
+
+        # Additive perturbations for unconstrained parameters.
+        candidate.z += scale * rng.standard_normal(n)
+
+        candidate.phase = wrap(
+            candidate.phase
+            + scale * np.pi * rng.standard_normal(n)
+        )
+
+        candidate.omega = float(np.clip(
+            candidate.omega + scale * rng.standard_normal(),
+            -OMEGA_MAX,
+            OMEGA_MAX,
+        ))
+
+        # Multiplicative changes preserve positivity before clipping.
+        candidate.D_psi = float(np.clip(
+            candidate.D_psi * np.exp(
+                scale * rng.standard_normal()
+            ),
+            D_MIN,
+            D_MAX,
+        ))
+
+        candidate.D_phi = float(np.clip(
+            candidate.D_phi * np.exp(
+                scale * rng.standard_normal()
+            ),
+            D_MIN,
+            D_MAX,
+        ))
+
+        return candidate
+
+    @staticmethod
+    def admissible(cfg):
+        """Check parameter finiteness and diffusion bounds."""
+        return bool(
+            np.all(np.isfinite(cfg.z))
+            and np.all(np.isfinite(cfg.phase))
+            and np.isfinite(cfg.omega)
+            and D_MIN <= cfg.D_psi <= D_MAX
+            and D_MIN <= cfg.D_phi <= D_MAX
+        )
+
+    def physically_valid(self, evaluation):
+        """Reject candidates exceeding the allowed norm-drift tolerance."""
+        return evaluation.norm_err <= self.norm_tol
+
+
+# ============================================================================
+# Incumbent-best memory
+# ============================================================================
+
+@dataclass
+class BestState:
+    """Store the best configuration and readout for one fixed objective."""
+
+    cfg: WaveConfig
+    loss: float
+    readout: np.ndarray
+    step: int
+
+    def offer(self, cfg, loss, readout, step):
+        """Replace the incumbent only when the objective strictly improves."""
+        if loss < self.loss:
+            self.cfg = cfg.copy()
+            self.loss = loss
+            self.readout = readout.copy()
+            self.step = step
+            return True
+
+        return False
+
+
+# ============================================================================
+# Shock detection with hysteresis
+# ============================================================================
+
+class ShockDetector:
+    """
+    Detect abrupt changes in pooled density and validation loss.
+
+    A shock is triggered when the combined normalized-change score exceeds
+    kappa. The detector returns to normal only after the configured number
+    of consecutive calm observations.
+    """
+
+    def __init__(
+        self,
+        alpha=1.0,
+        beta=1.0,
+        kappa=0.5,
+        hold=5,
+        c_rho=1e-3,
+        c_L=1e-6,
+    ):
+        self.alpha = alpha
+        self.beta = beta
+        self.kappa = kappa
+        self.hold = hold
+        self.c_rho = c_rho
+        self.c_L = c_L
+
+        self.prev_rho = None
+        self.prev_loss = None
+
+        self.regime = "normal"
+        self.calm = 0
+        self.q = 0.0
+
+    def update(self, rho, loss):
+        """Update the change score and return the current operating regime."""
+        if self.prev_rho is None:
+            self.prev_rho = rho.copy()
+            self.prev_loss = loss
+            return self.regime
+
+        # Scale-normalized changes make the detector less sensitive to
+        # the absolute magnitude of density and loss.
+        q_rho = np.linalg.norm(
+            rho - self.prev_rho
+        ) / (
+            self.c_rho + np.linalg.norm(self.prev_rho)
+        )
+
+        q_loss = abs(
+            loss - self.prev_loss
+        ) / (
+            self.c_L + abs(self.prev_loss)
+        )
+
+        self.q = self.alpha * q_rho + self.beta * q_loss
+
+        if self.q > self.kappa:
+            self.regime = "shock"
+            self.calm = 0
+        else:
+            self.calm += 1
+
+            # Hysteresis prevents an immediate reset after one calm step.
+            if self.calm >= self.hold:
+                self.regime = "normal"
+
+        self.prev_rho = rho.copy()
+        self.prev_loss = loss
+
+        return self.regime
+
+
+# ============================================================================
+# Main optimization loop
+# ============================================================================
+
+def run(iters=300, shock_at=150, seed=0, verbose=True):
+    """
+    Run physics-guided search and return global/adaptive best states.
+
+    The global incumbent always tracks the normal-task objective. At
+    shock_at, an adaptive incumbent is initialized from the global best
+    and optimized against the shock-task objective.
+
+    Returns
+    -------
+    Dictionary containing both incumbents, loss history, data, and grid.
+    """
+    if iters < 0:
+        raise ValueError("iters must be non-negative.")
+
+    if shock_at < 1 or shock_at > iters:
+        raise ValueError(
+            "shock_at must satisfy 1 <= shock_at <= iters."
+        )
+
+    rng = np.random.default_rng(seed)
+
+    grid = Grid(32)
+    engine = PhysicsEngine(grid)
+    data = make_data(rng)
+    detector = ShockDetector()
+
+    # Initial wave configuration.
+    cfg0 = WaveConfig(
+        z=np.zeros(grid.n),
+        phase=np.zeros(grid.n),
+        omega=0.5,
+        D_psi=0.5,
+        D_phi=0.5,
+    )
+
+    initial_eval = evaluate(cfg0, data, grid)
+
+    global_best = BestState(
+        cfg=cfg0.copy(),
+        loss=initial_eval.losses["normal"],
+        readout=initial_eval.readouts["normal"],
+        step=0,
+    )
+
+    adaptive_best = None
+    active = "normal"
+
+    global_history = [global_best.loss]
+    rejected = 0
+
+    for step in range(1, iters + 1):
+
+        # Switch objectives at the disturbance point while preserving the
+        # normal-task global incumbent.
+        if step == shock_at:
+            active = "shock"
+
+            current_eval = evaluate(
+                global_best.cfg, data, grid
+            )
+
+            detector.update(
+                current_eval.probe,
+                current_eval.losses[active],
+            )
+
+            adaptive_best = BestState(
+                cfg=global_best.cfg.copy(),
+                loss=current_eval.losses["shock"],
+                readout=current_eval.readouts["shock"],
+                step=step,
+            )
+
+        # Use the adaptive incumbent after the disturbance. Search scale
+        # increases only while the detector reports a shock regime.
+        center = (
+            adaptive_best.cfg
+            if adaptive_best is not None
+            else global_best.cfg
+        )
+
+        scale = (
+            ETA_SHOCK
+            if detector.regime == "shock"
+            else ETA_NORMAL
+        )
+
+        candidate = engine.propose(center, scale, rng)
+
+        if not engine.admissible(candidate):
+            rejected += 1
+            global_history.append(global_best.loss)
+            continue
+
+        candidate_eval = evaluate(candidate, data, grid)
+
+        if not engine.physically_valid(candidate_eval):
+            rejected += 1
+            global_history.append(global_best.loss)
+            continue
+
+        # Update each incumbent using its own fixed objective.
+        global_best.offer(
+            candidate,
+            candidate_eval.losses["normal"],
+            candidate_eval.readouts["normal"],
+            step,
+        )
+
+        if adaptive_best is not None:
+            adaptive_best.offer(
+                candidate,
+                candidate_eval.losses["shock"],
+                candidate_eval.readouts["shock"],
+                step,
+            )
+
+        detector.update(
+            candidate_eval.probe,
+            candidate_eval.losses[active],
+        )
+
+        global_history.append(global_best.loss)
+
+        if verbose and step % 50 == 0:
+            adaptive_loss = (
+                adaptive_best.loss
+                if adaptive_best is not None
+                else float("nan")
+            )
+
+            print(
+                f"iter {step:4d} | "
+                f"env={active:6s} | "
+                f"regime={detector.regime:6s} | "
+                f"q={detector.q:6.3f} | "
+                f"global best={global_best.loss:.5f} | "
+                f"adaptive best={adaptive_loss:.5f} | "
+                f"rejected={rejected}"
+            )
+
+    # The global incumbent must never worsen under its fixed objective.
+    assert all(
+        later <= earlier + 1e-12
+        for earlier, later in zip(
+            global_history, global_history[1:]
+        )
+    ), "Global best regressed."
+
+    return {
+        "global": global_best,
+        "adaptive": adaptive_best,
+        "global_history": global_history,
+        "data": data,
+        "grid": grid,
+    }
+
+
+# ============================================================================
+# Command-line entry point
+# ============================================================================
+
+if __name__ == "__main__":
+    results = run()
+
+    global_best = results["global"]
+    grid = results["grid"]
+    data = results["data"]
+
+    final_eval = evaluate(
+        global_best.cfg, data, grid
+    )
+
+    print(
+        "\nFinal global best "
+        f"(found at step {global_best.step}):"
+    )
+
+    print(
+        "  Validation loss, normal task: "
+        f"{final_eval.losses['normal']:.5f}"
+    )
+
+    print(
+        "  Validation loss, shock task:  "
+        f"{final_eval.losses['shock']:.5f}"
+    )
+
+    print(
+        "  Maximum joint-norm error:     "
+        f"{final_eval.norm_err:.2e}"
+    )
