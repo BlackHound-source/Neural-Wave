@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+csnf_benchmark.py - Self-contained evaluation of the Continuous Schrödinger
+Neural Field (CSNF) framework on chaotic time-series prediction.
+"""
+
+from dataclasses import dataclass
+import numpy as np
+
+TWO_PI = 2.0 * np.pi
+OMEGA_MAX = 3.0
+D_MIN, D_MAX = 0.05, 2.0
+POOL = 8
+
+# ----------------------------------------------------------------------------
+# Utilities & Core Framework
+# ----------------------------------------------------------------------------
+def softplus(z):
+    return np.logaddexp(0.0, z)
+
+def wrap(angle):
+    """Wrap angles into [-pi, pi)."""
+    return (angle + np.pi) % TWO_PI - np.pi
+
+class Grid:
+    def __init__(self, n=32, L=TWO_PI):
+        self.n, self.L = n, L
+        self.x = np.linspace(0.0, L, n, endpoint=False)
+        self.dx = L / n
+        shift_up = np.roll(np.eye(n), 1, axis=0)
+        shift_dn = np.roll(np.eye(n), -1, axis=0)
+        self.lap = (shift_up - 2.0 * np.eye(n) + shift_dn) / self.dx ** 2
+
+@dataclass
+class WaveConfig:
+    z: np.ndarray
+    phase: np.ndarray
+    omega: float
+    D_psi: float
+    D_phi: float
+    V_psi: float = 0.0
+    V_phi: float = 0.0
+
+    def amplitude(self):
+        return softplus(self.z)
+
+    def copy(self):
+        return WaveConfig(self.z.copy(), self.phase.copy(), self.omega,
+                          self.D_psi, self.D_phi, self.V_psi, self.V_phi)
+
+def evolve(cfg, psi0, phi0, grid, T=1.0, steps=20, tau=1.0):
+    n, dt = grid.n, T / steps
+    a = cfg.amplitude()
+    eye = np.eye(n)
+    H_psi = -cfg.D_psi * grid.lap + cfg.V_psi * eye
+    H_phi = -cfg.D_phi * grid.lap + cfg.V_phi * eye
+
+    U = np.concatenate([psi0, phi0]).astype(complex)
+    norm0 = np.vdot(U, U).real
+
+    for k in range(steps):
+        t_mid = (k + 0.5) * dt
+        J = np.diag(a * np.exp(1j * (cfg.phase - cfg.omega * t_mid)))
+        H = np.block([[H_psi, J], [J.conj().T, H_phi]])
+        lhs = np.eye(2 * n) + 0.5j * dt / tau * H
+        rhs = np.eye(2 * n) - 0.5j * dt / tau * H
+        U = np.linalg.solve(lhs, rhs @ U)
+
+    norm = np.vdot(U, U).real
+    norm_err = abs(norm - norm0) / max(norm0, 1e-12)
+    return U[:n], U[n:], norm_err
+
+def encode(u, grid, width=0.6):
+    center = grid.L * (0.25 + 0.5 * u)
+    d = np.angle(np.exp(1j * (grid.x - center)))
+    phi = np.exp(-0.5 * (d / width) ** 2).astype(complex)
+    psi = np.ones(grid.n, dtype=complex)
+    scale = np.sqrt(np.vdot(psi, psi).real + np.vdot(phi, phi).real)
+    return psi / scale, phi / scale
+
+def pool(v):
+    return v.reshape(POOL, -1).mean(axis=1)
+
+def features(cfg, u_values, grid):
+    rows, worst_norm_err = [], 0.0
+    for u in u_values:
+        psi, phi, nerr = evolve(cfg, *encode(u, grid), grid)
+        worst_norm_err = max(worst_norm_err, nerr)
+        rows.append(np.concatenate([pool(np.abs(psi) ** 2),
+                                    pool(np.abs(phi) ** 2), [1.0]]))
+    return np.array(rows), worst_norm_err
+
+class PhysicsEngine:
+    def __init__(self, grid, norm_tol=1e-6):
+        self.grid = grid
+        self.norm_tol = norm_tol
+
+    def propose(self, center, scale, rng):
+        n = self.grid.n
+        cand = center.copy()
+        cand.z = cand.z + scale * rng.standard_normal(n)
+        cand.phase = wrap(cand.phase + scale * np.pi * rng.standard_normal(n))
+        cand.omega = float(np.clip(cand.omega + scale * rng.standard_normal(), -OMEGA_MAX, OMEGA_MAX))
+        cand.D_psi = float(np.clip(cand.D_psi * np.exp(scale * rng.standard_normal()), D_MIN, D_MAX))
+        cand.D_phi = float(np.clip(cand.D_phi * np.exp(scale * rng.standard_normal()), D_MIN, D_MAX))
+        return cand
+
+    @staticmethod
+    def admissible(cfg):
+        return bool(np.all(np.isfinite(cfg.z)) and np.all(np.isfinite(cfg.phase))
+                    and np.isfinite(cfg.omega)
+                    and D_MIN <= cfg.D_psi <= D_MAX and D_MIN <= cfg.D_phi <= D_MAX)
+
+    def physically_valid(self, ev):
+        return ev.norm_err <= self.norm_tol
+
+@dataclass
+class BestState:
+    cfg: WaveConfig
+    loss: float
+    readout: np.ndarray
+    step: int
+
+    def offer(self, cfg, loss, readout, step):
+        if loss < self.loss:
+            self.cfg, self.loss = cfg.copy(), loss
+            self.readout, self.step = readout.copy(), step
+            return True
+        return False
+
+@dataclass
+class Evaluation:
+    losses: dict
+    readouts: dict
+    norm_err: float
+    probe: np.ndarray
+
+
+# ----------------------------------------------------------------------------
+# Real-World Mackey-Glass Benchmark Tasks
+# ----------------------------------------------------------------------------
+def generate_mackey_glass(length=1000, tau=17, sample_rate=1):
+    history_len = tau * sample_rate
+    x = np.zeros(length + history_len)
+    for i in range(history_len):
+        x[i] = 0.5 + 0.1 * np.random.randn()
+
+    beta, gamma, n_exp = 0.2, 0.1, 10.0
+    for i in range(history_len, length + history_len):
+        x_tau = x[i - history_len]
+        dx = (beta * x_tau) / (1.0 + x_tau**n_exp) - gamma * x[i - 1]
+        x[i] = x[i - 1] + dx
+
+    series = x[history_len:]
+    return (series - series.min()) / (series.max() - series.min() + 1e-8)
+
+def make_real_world_data(n_tr=48, n_va=24):
+    raw_data = generate_mackey_glass(length=200 + n_tr + n_va)
+    u_pool = raw_data[:n_tr + n_va]
+    u_tr = u_pool[:n_tr]
+    u_va = u_pool[n_tr:n_tr + n_va]
+
+    y_tr = {"mg_chaotic": np.sin(np.pi * u_tr) * u_tr + 0.2 * np.cos(4.0 * u_tr)}
+    y_va = {"mg_chaotic": np.sin(np.pi * u_va) * u_va + 0.2 * np.cos(4.0 * u_va)}
+
+    return type('Data', (), {'u_tr': u_tr, 'u_va': u_va, 'y_tr': y_tr, 'y_va': y_va})()
+
+def evaluate_benchmark(cfg, data, grid):
+    F_tr, err_tr = features(cfg, data.u_tr, grid)
+    F_va, err_va = features(cfg, data.u_va, grid)
+
+    losses, readouts = {}, {}
+    for name in data.y_tr:
+        lam = 1e-4
+        w = np.linalg.solve(F_tr.T @ F_tr + lam * np.eye(F_tr.shape[1]), F_tr.T @ data.y_tr[name])
+        losses[name] = float(np.mean((F_va @ w - data.y_va[name]) ** 2))
+        readouts[name] = w
+
+    return Evaluation(losses, readouts, max(err_tr, err_va), F_tr[0, :POOL].copy())
+
+def run_benchmark(iters=100, seed=42):
+    rng = np.random.default_rng(seed)
+    grid = Grid(32)
+    engine = PhysicsEngine(grid)
+    data = make_real_world_data()
+
+    cfg0 = WaveConfig(z=np.zeros(grid.n), phase=np.zeros(grid.n),
+                      omega=0.5, D_psi=0.5, D_phi=0.5)
+
+    ev0 = evaluate_benchmark(cfg0, data, grid)
+    global_best = BestState(cfg0.copy(), ev0.losses["mg_chaotic"], ev0.readouts["mg_chaotic"], 0)
+
+    print("Starting CSNF Benchmark on Mackey-Glass Dynamics...")
+    print(f"Initial Validation MSE: {global_best.loss:.6f} | Norm Error: {ev0.norm_err:.2e}")
+
+    for t in range(1, iters + 1):
+        scale = 0.05
+        cand = engine.propose(global_best.cfg, scale, rng)
+        if not engine.admissible(cand): continue
+
+        ev = evaluate_benchmark(cand, data, grid)
+        if not engine.physically_valid(ev): continue
+
+        updated = global_best.offer(cand, ev.losses["mg_chaotic"], ev.readouts["mg_chaotic"], t)
+        if updated and t % 20 == 0:
+            print(f"Iter {t:3d} | New Best Validation MSE: {global_best.loss:.6f}")
+
+    print("\nBenchmark Optimization Complete.")
+    print(f"Optimal Field Propagation D_psi: {global_best.cfg.D_psi:.4f}")
+    print(f"Optimal Field Propagation D_phi: {global_best.cfg.D_phi:.4f}")
+    print(f"Final Best Validation MSE: {global_best.loss:.5f}")
+
+if __name__ == "__main__":
+    run_benchmark()
