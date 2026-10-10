@@ -1,0 +1,1173 @@
+#!/usr/bin/env python3
+"""
+CSNF Unified Pipeline — Leakage-Safe Version
+
+Features:
+1. Separate training, validation, and test sets.
+2. Training-only normalization.
+3. Training-only readout fitting.
+4. Validation-only hyperparameter/configuration selection.
+5. Independent final test evaluation.
+6. CSV prediction export and evaluation summary.
+"""
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+
+# ================================================================
+# 1. GLOBAL CONFIGURATION
+# ================================================================
+
+TWO_PI = 2.0 * np.pi
+OMEGA_MAX = 3.0
+D_MIN, D_MAX = 0.05, 2.0
+POOL = 8
+RIDGE = 1e-4
+
+
+# ================================================================
+# 2. MATHEMATICAL UTILITIES
+# ================================================================
+
+def softplus(z):
+    return np.logaddexp(0.0, z)
+
+
+def wrap(angle):
+    """Wrap angles into [-pi, pi)."""
+    return (angle + np.pi) % TWO_PI - np.pi
+
+
+def mse(y_true, y_pred):
+    """Mean squared error."""
+    return float(np.mean(
+        (np.asarray(y_true) - np.asarray(y_pred)) ** 2
+    ))
+
+
+# ================================================================
+# 3. SPATIAL GRID
+# ================================================================
+
+class Grid:
+
+    def __init__(self, n=32, L=TWO_PI):
+
+        if n % POOL != 0:
+            raise ValueError(
+                f"Grid size must be divisible by {POOL}."
+            )
+
+        self.n = n
+        self.L = L
+
+        self.x = np.linspace(
+            0.0, L, n, endpoint=False
+        )
+
+        self.dx = L / n
+
+        shift_up = np.roll(
+            np.eye(n), 1, axis=0
+        )
+
+        shift_dn = np.roll(
+            np.eye(n), -1, axis=0
+        )
+
+        self.lap = (
+            shift_up
+            - 2.0 * np.eye(n)
+            + shift_dn
+        ) / self.dx**2
+
+
+# ================================================================
+# 4. WAVE CONFIGURATION
+# ================================================================
+
+@dataclass
+class WaveConfig:
+
+    z: np.ndarray
+    phase: np.ndarray
+    omega: float
+
+    D_psi: float
+    D_phi: float
+
+    V_psi: float = 0.0
+    V_phi: float = 0.0
+
+    def amplitude(self):
+        return softplus(self.z)
+
+    def copy(self):
+
+        return WaveConfig(
+            self.z.copy(),
+            self.phase.copy(),
+            self.omega,
+            self.D_psi,
+            self.D_phi,
+            self.V_psi,
+            self.V_phi
+        )
+
+
+# ================================================================
+# 5. COUPLED SCHRODINGER FIELD EVOLUTION
+# ================================================================
+
+def evolve(
+    cfg,
+    psi0,
+    phi0,
+    grid,
+    T=1.0,
+    steps=20,
+    tau=1.0
+):
+
+    n = grid.n
+    dt = T / steps
+
+    a = cfg.amplitude()
+    eye = np.eye(n)
+
+    H_psi = (
+        -cfg.D_psi * grid.lap
+        + cfg.V_psi * eye
+    )
+
+    H_phi = (
+        -cfg.D_phi * grid.lap
+        + cfg.V_phi * eye
+    )
+
+    U = np.concatenate(
+        [psi0, phi0]
+    ).astype(complex)
+
+    norm0 = np.vdot(U, U).real
+
+    for k in range(steps):
+
+        t_mid = (k + 0.5) * dt
+
+        J = np.diag(
+            a * np.exp(
+                1j * (
+                    cfg.phase
+                    - cfg.omega * t_mid
+                )
+            )
+        )
+
+        H = np.block([
+            [H_psi, J],
+            [J.conj().T, H_phi]
+        ])
+
+        lhs = (
+            np.eye(2 * n)
+            + 0.5j * dt / tau * H
+        )
+
+        rhs = (
+            np.eye(2 * n)
+            - 0.5j * dt / tau * H
+        )
+
+        U = np.linalg.solve(
+            lhs,
+            rhs @ U
+        )
+
+    norm = np.vdot(U, U).real
+
+    norm_err = (
+        abs(norm - norm0)
+        / max(norm0, 1e-12)
+    )
+
+    return U[:n], U[n:], norm_err
+
+
+# ================================================================
+# 6. INPUT ENCODING
+# ================================================================
+
+def encode(u, grid, width=0.6):
+
+    center = grid.L * (
+        0.25 + 0.5 * float(u)
+    )
+
+    d = np.angle(
+        np.exp(1j * (grid.x - center))
+    )
+
+    phi = np.exp(
+        -0.5 * (d / width) ** 2
+    ).astype(complex)
+
+    psi = np.ones(
+        grid.n, dtype=complex
+    )
+
+    scale = np.sqrt(
+        np.vdot(psi, psi).real
+        + np.vdot(phi, phi).real
+    )
+
+    return psi / scale, phi / scale
+
+
+# ================================================================
+# 7. FEATURE EXTRACTION
+# ================================================================
+
+def pool(v):
+    return v.reshape(POOL, -1).mean(axis=1)
+
+
+def features(cfg, u_values, grid):
+
+    rows = []
+    worst_norm_err = 0.0
+
+    for u in np.asarray(u_values).reshape(-1):
+
+        psi, phi, nerr = evolve(
+            cfg,
+            *encode(u, grid),
+            grid
+        )
+
+        worst_norm_err = max(
+            worst_norm_err, nerr
+        )
+
+        row = np.concatenate([
+            pool(np.abs(psi) ** 2),
+            pool(np.abs(phi) ** 2),
+            [1.0]
+        ])
+
+        rows.append(row)
+
+    return np.asarray(rows), worst_norm_err
+
+
+# ================================================================
+# 8. TRAINING-ONLY NORMALIZATION
+# ================================================================
+
+def fit_minmax(train_values):
+    """
+    Fit min/max using training data only.
+    Never pass validation or test data to this function.
+    """
+
+    lo = float(np.min(train_values))
+    hi = float(np.max(train_values))
+
+    if np.isclose(hi, lo):
+        hi = lo + 1.0
+
+    return lo, hi
+
+
+def apply_minmax(values, bounds):
+    """
+    Apply already-fitted training statistics.
+    No clipping: out-of-range test values remain visible.
+    """
+
+    lo, hi = bounds
+
+    return (
+        np.asarray(values) - lo
+    ) / (hi - lo)
+
+
+# ================================================================
+# 9. DATA CONTAINER
+# ================================================================
+
+@dataclass
+class RegressionData:
+
+    u_tr: np.ndarray
+    u_va: np.ndarray
+    u_te: np.ndarray
+
+    y_tr: dict
+    y_va: dict
+    y_te: dict
+
+    metadata: dict
+
+
+# ================================================================
+# 10. MACKEY-GLASS DATASET
+# ================================================================
+
+def generate_mackey_glass(
+    length=1000,
+    tau=17,
+    sample_rate=1,
+    seed=42
+):
+    """
+    Generate the raw Mackey-Glass-like sequence.
+    No full-series normalization is performed.
+    """
+
+    rng = np.random.default_rng(seed)
+
+    history_len = tau * sample_rate
+
+    x = np.zeros(
+        length + history_len,
+        dtype=float
+    )
+
+    x[:history_len] = (
+        0.5
+        + 0.1 * rng.standard_normal(history_len)
+    )
+
+    beta = 0.2
+    gamma = 0.1
+    n_exp = 10.0
+
+    for i in range(history_len, length + history_len):
+
+        x_tau = x[i - history_len]
+
+        dx = (
+            beta * x_tau
+            / (1.0 + x_tau**n_exp)
+            - gamma * x[i - 1]
+        )
+
+        x[i] = x[i - 1] + dx
+
+    return x[history_len:]
+
+
+def make_mackey_glass_data(
+    n_tr=48,
+    n_va=24,
+    n_te=24,
+    seed=42
+):
+    """
+    Chronological train/validation/test split.
+
+    Scaling statistics are fitted on training inputs only.
+
+    Important:
+    This is a synthetic regression task, not next-step
+    time-series forecasting.
+    """
+
+    if min(n_tr, n_va, n_te) < 1:
+        raise ValueError(
+            "Train, validation, and test sizes must be positive."
+        )
+
+    raw = generate_mackey_glass(
+        length=n_tr + n_va + n_te,
+        seed=seed
+    )
+
+    # Chronological partition
+    raw_tr = raw[:n_tr]
+
+    raw_va = raw[
+        n_tr:n_tr + n_va
+    ]
+
+    raw_te = raw[
+        n_tr + n_va:
+        n_tr + n_va + n_te
+    ]
+
+    # Fit normalization on training data only
+    u_bounds = fit_minmax(raw_tr)
+
+    u_tr = apply_minmax(
+        raw_tr, u_bounds
+    )
+
+    u_va = apply_minmax(
+        raw_va, u_bounds
+    )
+
+    u_te = apply_minmax(
+        raw_te, u_bounds
+    )
+
+    # Deterministic synthetic regression target
+    def target_fn(u):
+
+        return (
+            np.sin(np.pi * u) * u
+            + 0.2 * np.cos(4.0 * u)
+        )
+
+    y_tr = target_fn(u_tr)
+    y_va = target_fn(u_va)
+    y_te = target_fn(u_te)
+
+    return RegressionData(
+        u_tr=u_tr,
+        u_va=u_va,
+        u_te=u_te,
+
+        y_tr={"mg_chaotic": y_tr},
+        y_va={"mg_chaotic": y_va},
+        y_te={"mg_chaotic": y_te},
+
+        metadata={
+            "split": "chronological",
+            "input_scaler_fit_on": "train_only",
+            "sizes": {
+                "train": n_tr,
+                "validation": n_va,
+                "test": n_te
+            }
+        }
+    )
+
+
+# ================================================================
+# 11. LORENZ DATASET
+# ================================================================
+
+def make_lorenz_data(
+    n_tr=48,
+    n_va=24,
+    n_te=24
+):
+    """
+    Lorenz regression task.
+
+    Input and target scaling use training statistics only.
+    """
+
+    dt = 0.01
+
+    n_total = n_tr + n_va + n_te
+
+    steps = 300 + n_total
+
+    xs = np.zeros(steps)
+    ys = np.zeros(steps)
+    zs = np.zeros(steps)
+
+    xs[0] = 1.0
+    ys[0] = 1.0
+    zs[0] = 1.0
+
+    sigma = 10.0
+    rho = 28.0
+    beta = 8.0 / 3.0
+
+    for i in range(steps - 1):
+
+        dx = sigma * (
+            ys[i] - xs[i]
+        )
+
+        dy = (
+            xs[i] * (rho - zs[i])
+            - ys[i]
+        )
+
+        dz = (
+            xs[i] * ys[i]
+            - beta * zs[i]
+        )
+
+        xs[i + 1] = xs[i] + dx * dt
+        ys[i + 1] = ys[i] + dy * dt
+        zs[i + 1] = zs[i] + dz * dt
+
+    start = 300
+
+    z_raw = zs[
+        start:start + n_total
+    ]
+
+    x_raw = xs[
+        start:start + n_total
+    ]
+
+    # Fit scalers on the training partition only
+    z_bounds = fit_minmax(
+        z_raw[:n_tr]
+    )
+
+    x_bounds = fit_minmax(
+        x_raw[:n_tr]
+    )
+
+    u = apply_minmax(
+        z_raw, z_bounds
+    )
+
+    y = apply_minmax(
+        x_raw, x_bounds
+    )
+
+    train_end = n_tr
+    val_end = n_tr + n_va
+
+    return RegressionData(
+        u[:train_end],
+        u[train_end:val_end],
+        u[val_end:],
+
+        {"lorenz_x": y[:train_end]},
+        {"lorenz_x": y[train_end:val_end]},
+        {"lorenz_x": y[val_end:]},
+
+        {
+            "split": "chronological",
+            "input_scaler_fit_on": "train_only",
+            "target_scaler_fit_on": "train_only"
+        }
+    )
+
+
+# ================================================================
+# 12. FRIEDMAN-STYLE SYNTHETIC REGRESSION
+# ================================================================
+
+def make_friedman_data(
+    n_tr=50,
+    n_va=25,
+    n_te=25,
+    seed=42
+):
+    """
+    Random synthetic regression.
+
+    This function uses a seeded random sample rather than
+    a chronological sequence split.
+    """
+
+    rng = np.random.default_rng(seed)
+
+    n_total = n_tr + n_va + n_te
+
+    X1 = rng.uniform(
+        0.0, 100.0, n_total
+    )
+
+    X2 = rng.uniform(
+        40.0, 520.0, n_total
+    )
+
+    X3 = rng.uniform(
+        0.0, 1.0, n_total
+    )
+
+    X4 = rng.uniform(
+        1.0, 11.0, n_total
+    )
+
+    y_raw = np.sqrt(
+        X1**2
+        + (
+            X2 * X3
+            - 1.0 / (X2 * X4)
+        )**2
+    )
+
+    # Training-only normalization
+    u_bounds = fit_minmax(
+        X1[:n_tr]
+    )
+
+    y_bounds = fit_minmax(
+        y_raw[:n_tr]
+    )
+
+    u = apply_minmax(
+        X1, u_bounds
+    )
+
+    y = apply_minmax(
+        y_raw, y_bounds
+    )
+
+    train_end = n_tr
+    val_end = n_tr + n_va
+
+    return RegressionData(
+        u[:train_end],
+        u[train_end:val_end],
+        u[val_end:],
+
+        {"friedman": y[:train_end]},
+        {"friedman": y[train_end:val_end]},
+        {"friedman": y[val_end:]},
+
+        {
+            "split": "seeded_random",
+            "input_scaler_fit_on": "train_only",
+            "target_scaler_fit_on": "train_only"
+        }
+    )
+
+
+# ================================================================
+# 13. PHYSICS ENGINE
+# ================================================================
+
+class PhysicsEngine:
+
+    def __init__(
+        self,
+        grid,
+        norm_tol=1e-6
+    ):
+
+        self.grid = grid
+        self.norm_tol = norm_tol
+
+    def propose(
+        self,
+        center,
+        scale,
+        rng
+    ):
+
+        n = self.grid.n
+
+        cand = center.copy()
+
+        cand.z = (
+            cand.z
+            + scale * rng.standard_normal(n)
+        )
+
+        cand.phase = wrap(
+            cand.phase
+            + scale * np.pi
+            * rng.standard_normal(n)
+        )
+
+        cand.omega = float(
+            np.clip(
+                cand.omega
+                + scale * rng.standard_normal(),
+                -OMEGA_MAX,
+                OMEGA_MAX
+            )
+        )
+
+        cand.D_psi = float(
+            np.clip(
+                cand.D_psi
+                * np.exp(
+                    scale * rng.standard_normal()
+                ),
+                D_MIN,
+                D_MAX
+            )
+        )
+
+        cand.D_phi = float(
+            np.clip(
+                cand.D_phi
+                * np.exp(
+                    scale * rng.standard_normal()
+                ),
+                D_MIN,
+                D_MAX
+            )
+        )
+
+        return cand
+
+    @staticmethod
+    def admissible(cfg):
+
+        return bool(
+            np.all(np.isfinite(cfg.z))
+            and np.all(np.isfinite(cfg.phase))
+            and np.isfinite(cfg.omega)
+            and D_MIN <= cfg.D_psi <= D_MAX
+            and D_MIN <= cfg.D_phi <= D_MAX
+        )
+
+    def physically_valid(self, norm_err):
+
+        return norm_err <= self.norm_tol
+
+
+# ================================================================
+# 14. BEST MODEL STATE
+# ================================================================
+
+@dataclass
+class BestState:
+
+    cfg: WaveConfig
+    loss: float
+    readout: np.ndarray
+    step: int
+
+    def offer(
+        self,
+        cfg,
+        loss,
+        readout,
+        step
+    ):
+
+        if loss < self.loss:
+
+            self.cfg = cfg.copy()
+            self.loss = float(loss)
+            self.readout = readout.copy()
+            self.step = int(step)
+
+            return True
+
+        return False
+
+
+# ================================================================
+# 15. READOUT FITTING
+# ================================================================
+
+def fit_ridge(
+    features_matrix,
+    targets,
+    ridge=RIDGE
+):
+    """
+    Fit linear readout weights.
+
+    Only training features and training targets should
+    be passed during model selection.
+    """
+
+    gram = (
+        features_matrix.T @ features_matrix
+        + ridge * np.eye(
+            features_matrix.shape[1]
+        )
+    )
+
+    return np.linalg.solve(
+        gram,
+        features_matrix.T @ np.asarray(targets)
+    )
+
+
+# ================================================================
+# 16. EXPORT TEST PREDICTIONS
+# ================================================================
+
+def export_results(
+    u_data,
+    y_actual,
+    y_pred,
+    filename
+):
+
+    errors = (
+        np.asarray(y_actual)
+        - np.asarray(y_pred)
+    )
+
+    df = pd.DataFrame({
+        "Input_Coordinate_u": u_data,
+        "Ground_Truth_y": y_actual,
+        "Model_Prediction_y": y_pred,
+        "Squared_Error": errors**2
+    })
+
+    df.to_csv(
+        filename,
+        index=False
+    )
+
+    print(f"Saved test predictions: {filename}")
+
+    if IN_COLAB:
+        files.download(filename)
+
+
+# ================================================================
+# 17. MAIN LEAKAGE-SAFE TRAINING PIPELINE
+# ================================================================
+
+def run_pipeline(
+    n_tr=48,
+    n_va=24,
+    n_te=24,
+    iterations=50,
+    seed=42,
+    output_csv="optimized_mackey_glass_test_predictions.csv"
+):
+
+    print("=" * 65)
+    print("CSNF LEAKAGE-SAFE PIPELINE")
+    print("=" * 65)
+
+    # ------------------------------------------------------------
+    # STEP A: Generate independent chronological partitions
+    # ------------------------------------------------------------
+
+    dataset = make_mackey_glass_data(
+        n_tr=n_tr,
+        n_va=n_va,
+        n_te=n_te,
+        seed=seed
+    )
+
+    target_key = "mg_chaotic"
+
+    print("\nDATA PARTITIONS")
+    print("-" * 65)
+
+    print(f"Training samples:   {len(dataset.u_tr)}")
+    print(f"Validation samples: {len(dataset.u_va)}")
+    print(f"Test samples:       {len(dataset.u_te)}")
+
+    print(
+        "Input normalization: training partition only"
+    )
+
+    # ------------------------------------------------------------
+    # STEP B: Initialize the physics engine
+    # ------------------------------------------------------------
+
+    grid = Grid(32)
+
+    engine = PhysicsEngine(grid)
+
+    cfg0 = WaveConfig(
+        z=np.zeros(grid.n),
+        phase=np.zeros(grid.n),
+        omega=0.5,
+        D_psi=0.5,
+        D_phi=0.5
+    )
+
+    rng = np.random.default_rng(seed)
+
+    # ------------------------------------------------------------
+    # STEP C: Fit baseline using training data
+    # ------------------------------------------------------------
+
+    F_tr0, err_tr0 = features(
+        cfg0,
+        dataset.u_tr,
+        grid
+    )
+
+    F_va0, err_va0 = features(
+        cfg0,
+        dataset.u_va,
+        grid
+    )
+
+    if not engine.physically_valid(
+        max(err_tr0, err_va0)
+    ):
+        raise RuntimeError(
+            "Initial configuration failed norm validation."
+        )
+
+    # Readout is fitted using TRAINING DATA ONLY.
+    w0 = fit_ridge(
+        F_tr0,
+        dataset.y_tr[target_key]
+    )
+
+    # Validation is used only for configuration selection.
+    initial_val_loss = mse(
+        dataset.y_va[target_key],
+        F_va0 @ w0
+    )
+
+    global_best = BestState(
+        cfg=cfg0.copy(),
+        loss=initial_val_loss,
+        readout=w0,
+        step=0
+    )
+
+    accepted = 0
+
+    print("\nINITIAL MODEL")
+    print("-" * 65)
+    print(
+        f"Initial validation MSE: {initial_val_loss:.8f}"
+    )
+
+    # ------------------------------------------------------------
+    # STEP D: Optimize configurations using validation MSE
+    # ------------------------------------------------------------
+
+    print("\nVALIDATION-GUIDED OPTIMIZATION")
+    print("-" * 65)
+
+    for t in range(1, iterations + 1):
+
+        cand = engine.propose(
+            global_best.cfg,
+            scale=0.05,
+            rng=rng
+        )
+
+        if not engine.admissible(cand):
+            continue
+
+        F_tr, err_tr = features(
+            cand,
+            dataset.u_tr,
+            grid
+        )
+
+        F_va, err_va = features(
+            cand,
+            dataset.u_va,
+            grid
+        )
+
+        if not engine.physically_valid(
+            max(err_tr, err_va)
+        ):
+            continue
+
+        # CRITICAL:
+        # Fit readout on training targets only.
+        w_cand = fit_ridge(
+            F_tr,
+            dataset.y_tr[target_key]
+        )
+
+        # Validation selects the configuration.
+        val_loss = mse(
+            dataset.y_va[target_key],
+            F_va @ w_cand
+        )
+
+        if global_best.offer(
+            cand,
+            val_loss,
+            w_cand,
+            t
+        ):
+            accepted += 1
+
+    print(
+        f"Best validation MSE: "
+        f"{global_best.loss:.8f}"
+    )
+
+    print(
+        f"Selected iteration: {global_best.step}"
+    )
+
+    print(
+        f"Selected D_psi: "
+        f"{global_best.cfg.D_psi:.6f}"
+    )
+
+    print(
+        f"Accepted improvements: {accepted}"
+    )
+
+    # ------------------------------------------------------------
+    # STEP E: Freeze model before accessing test labels
+    # ------------------------------------------------------------
+
+    # No refitting, tuning, or configuration selection occurs
+    # using test data. The selected training-fitted readout
+    # remains unchanged.
+
+    frozen_cfg = global_best.cfg.copy()
+    frozen_readout = global_best.readout.copy()
+
+    # Generate test features only after selection is complete.
+    F_te, err_te = features(
+        frozen_cfg,
+        dataset.u_te,
+        grid
+    )
+
+    if not engine.physically_valid(err_te):
+        raise RuntimeError(
+            "Selected model failed test-time norm validation."
+        )
+
+    # Predict using the frozen model.
+    test_preds = F_te @ frozen_readout
+
+    # Test labels are accessed only for final evaluation.
+    test_mse = mse(
+        dataset.y_te[target_key],
+        test_preds
+    )
+
+    # ------------------------------------------------------------
+    # STEP F: Final independent test evaluation
+    # ------------------------------------------------------------
+
+    print("\n" + "=" * 65)
+    print("FINAL HELD-OUT TEST RESULTS")
+    print("=" * 65)
+
+    print(
+        f"Training MSE: "
+        f"{mse(dataset.y_tr[target_key], F_tr0 @ w0):.8f}"
+    )
+
+    print(
+        f"Best validation MSE: "
+        f"{global_best.loss:.8f}"
+    )
+
+    print(
+        f"Independent test MSE: {test_mse:.8f}"
+    )
+
+    print(
+        "\nTest data was not used for preprocessing, "
+        "readout fitting, or model selection."
+    )
+
+    # ------------------------------------------------------------
+    # STEP G: Export predictions
+    # ------------------------------------------------------------
+
+    export_results(
+        u_data=dataset.u_te,
+        y_actual=dataset.y_te[target_key],
+        y_pred=test_preds,
+        filename=output_csv
+    )
+
+    # ------------------------------------------------------------
+    # STEP H: Export audit summary
+    # ------------------------------------------------------------
+
+    summary_path = str(
+        Path(output_csv).with_name(
+            Path(output_csv).stem + "_summary.txt"
+        )
+    )
+
+    with open(
+        summary_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        f.write(
+            "CSNF Leakage-Safe Evaluation Summary\n"
+        )
+
+        f.write(
+            "Dataset: Synthetic Mackey-Glass-derived regression\n"
+        )
+
+        f.write(
+            f"Training samples: {n_tr}\n"
+        )
+
+        f.write(
+            f"Validation samples: {n_va}\n"
+        )
+
+        f.write(
+            f"Test samples: {n_te}\n"
+        )
+
+        f.write(
+            "Split: chronological\n"
+        )
+
+        f.write(
+            "Input scaling: training partition only\n"
+        )
+
+        f.write(
+            "Readout fitting: training partition only\n"
+        )
+
+        f.write(
+            "Configuration selection: validation MSE only\n"
+        )
+
+        f.write(
+            "Test usage: final evaluation only\n"
+        )
+
+        f.write(
+            f"Best validation MSE: "
+            f"{global_best.loss:.10f}\n"
+        )
+
+        f.write(
+            f"Independent test MSE: "
+            f"{test_mse:.10f}\n"
+        )
+
+        f.write(
+            f"Selected iteration: "
+            f"{global_best.step}\n"
+        )
+
+    print(f"\nSaved audit summary: {summary_path}")
+
+    print("\nPIPELINE COMPLETE")
+
+    return {
+        "validation_mse": global_best.loss,
+        "test_mse": test_mse,
+        "best_step": global_best.step,
+        "prediction_csv": output_csv,
+        "summary_txt": summary_path
+    }
+
+
+# ================================================================
+# 18. EXECUTION
+# ================================================================
+
+if __name__ == "__main__":
+
+    results = run_pipeline(
+        n_tr=48,
+        n_va=24,
+        n_te=24,
+        iterations=50,
+        seed=42
+    )
+
+    print("\nFINAL METRICS")
+    print(results)
