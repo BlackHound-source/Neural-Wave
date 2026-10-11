@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+rcsnf_stabilized.py - Stabilized Recurrent Continuous Schrödinger Neural Field.
+Features:
+  1. Geodesic velocity winding on S1 (eliminates angle-wrapping impulse shocks).
+  2. Numerically stable thin-SVD Tikhonov readout with spectral truncation.
+  3. Continuous Cayley-unitary wave evolution and persistent state memory.
+"""
+
+from dataclasses import dataclass
+import numpy as np
+
+TWO_PI = 2.0 * np.pi
+
+
+def softplus(z: np.ndarray) -> np.ndarray:
+    return np.logaddexp(0.0, z)
+
+
+def wrap(angle: np.ndarray) -> np.ndarray:
+    return (angle + np.pi) % TWO_PI - np.pi
+
+
+class SpatialRingGrid:
+    def __init__(self, n: int = 32, L: float = TWO_PI):
+        self.n = n
+        self.L = L
+        self.x = np.linspace(0.0, L, n, endpoint=False)
+        self.dx = L / n
+        shift_up = np.roll(np.eye(n), 1, axis=0)
+        shift_dn = np.roll(np.eye(n), -1, axis=0)
+        self.lap = (shift_up - 2.0 * np.eye(n) + shift_dn) / (self.dx ** 2)
+
+
+@dataclass
+class RecurrentWaveConfig:
+    z: np.ndarray
+    phase: np.ndarray
+    omegas: np.ndarray
+    omega_weights: np.ndarray
+    D_psi: float
+    D_phi: float
+    alpha_inject: float
+    V_amp_psi: float = 0.5
+    V_amp_phi: float = 0.5
+
+    def amplitude(self) -> np.ndarray:
+        return softplus(self.z)
+
+    def copy(self):
+        return RecurrentWaveConfig(
+            self.z.copy(),
+            self.phase.copy(),
+            self.omegas.copy(),
+            self.omega_weights.copy(),
+            float(self.D_psi),
+            float(self.D_phi),
+            float(self.alpha_inject),
+            float(self.V_amp_psi),
+            float(self.V_amp_phi),
+        )
+
+
+class StabilizedRCSNF:
+    def __init__(
+        self,
+        grid_n: int = 48,
+        num_lags: int = 3,
+        packet_width: float = 0.35,
+        pool_bins: int = 8,
+        t_evolve: float = 1.0,
+        evolve_steps: int = 20,
+        tau: float = 1.0,
+        washout: int = 30,
+        ridge_lambda: float = 1e-4,
+        rcond: float = 1e-4,
+        is_periodic_coord: bool = False,
+        cfg: RecurrentWaveConfig = None,
+    ):
+        assert grid_n % pool_bins == 0, "grid_n must be divisible by pool_bins"
+        self.grid = SpatialRingGrid(n=grid_n)
+        self.num_lags = num_lags
+        self.packet_width = packet_width
+        self.pool_bins = pool_bins
+        self.t_evolve = t_evolve
+        self.evolve_steps = evolve_steps
+        self.tau = tau
+        self.washout = washout
+        self.ridge_lambda = ridge_lambda
+        self.rcond = rcond
+        self.is_periodic_coord = is_periodic_coord
+
+        if cfg is None:
+            self.cfg = RecurrentWaveConfig(
+                z=np.zeros(self.grid.n),
+                phase=np.zeros(self.grid.n),
+                omegas=np.array([0.5, 1.25, 2.75]),
+                omega_weights=np.array([0.6, 0.3, 0.1]),
+                D_psi=0.25,
+                D_phi=0.25,
+                alpha_inject=0.60,
+                V_amp_psi=0.4,
+                V_amp_phi=0.4,
+            )
+        else:
+            self.cfg = cfg.copy()
+
+        self.weights: np.ndarray = None
+        self.last_state: np.ndarray = None
+
+    def _encode_lags(self, u_lags: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        phi = np.zeros(self.grid.n, dtype=np.complex128)
+        psi = np.ones(self.grid.n, dtype=np.complex128) / np.sqrt(self.grid.n)
+
+        k = len(u_lags)
+        weights = np.exp(-0.35 * np.arange(k))
+        weights /= np.sum(weights)
+
+        # Geodesic velocity calculation (suppresses boundary wrap jumps)
+        if k > 1:
+            diff = u_lags[0] - u_lags[1]
+            if self.is_periodic_coord:
+                velocity = np.arctan2(np.sin(diff), np.cos(diff))
+            else:
+                velocity = np.clip(diff, -1.0, 1.0)
+        else:
+            velocity = 0.0
+
+        for i, val in enumerate(u_lags):
+            center = self.grid.L * (0.15 + 0.70 * np.clip(val, 0.0, 1.0) + (i * 0.15)) % self.grid.L
+            d = np.angle(np.exp(1j * (self.grid.x - center)))
+            packet = np.exp(-0.5 * (d / max(self.packet_width, 1e-4)) ** 2)
+            phase_tilt = np.exp(1j * (velocity * (i + 1) * np.pi * self.grid.x / self.grid.L))
+            phi += weights[i] * packet.astype(np.complex128) * phase_tilt
+
+        norm = np.sqrt(max(np.vdot(psi, psi).real + np.vdot(phi, phi).real, 1e-12))
+        return psi / norm, phi / norm
+
+    def _step(self, prev_U: np.ndarray, u_lags: np.ndarray) -> tuple[np.ndarray, float]:
+        n = self.grid.n
+        dt = self.t_evolve / self.evolve_steps
+        a = self.cfg.amplitude()
+
+        psi_inj, phi_inj = self._encode_lags(u_lags)
+        U_inj = np.concatenate([psi_inj, phi_inj]).astype(np.complex128)
+
+        if prev_U is None:
+            U = U_inj
+        else:
+            U = (1.0 - self.cfg.alpha_inject) * prev_U + self.cfg.alpha_inject * U_inj
+            U = U / np.sqrt(max(np.vdot(U, U).real, 1e-12))
+
+        norm0 = np.vdot(U, U).real
+
+        V_psi = self.cfg.V_amp_psi * np.cos(2.0 * self.grid.x)
+        V_phi = self.cfg.V_amp_phi * np.sin(3.0 * self.grid.x)
+        H_psi = -self.cfg.D_psi * self.grid.lap + np.diag(V_psi)
+        H_phi = -self.cfg.D_phi * self.grid.lap + np.diag(V_phi)
+
+        for k_idx in range(self.evolve_steps):
+            t_mid = (k_idx + 0.5) * dt
+            coupling = np.zeros(n, dtype=np.complex128)
+            for w, weight in zip(self.cfg.omegas, self.cfg.omega_weights):
+                coupling += weight * np.exp(1j * (self.cfg.phase - w * t_mid))
+
+            J = np.diag(a * coupling)
+            H = np.block([[H_psi, J], [J.conj().T, H_phi]])
+
+            lhs = np.eye(2 * n, dtype=np.complex128) + (0.5j * dt / self.tau) * H
+            rhs = np.eye(2 * n, dtype=np.complex128) - (0.5j * dt / self.tau) * H
+            U = np.linalg.solve(lhs, rhs @ U)
+
+        norm_err = abs(np.vdot(U, U).real - norm0) / max(norm0, 1e-12)
+        return U, norm_err
+
+    def transform(self, x_seq: np.ndarray, init_state: np.ndarray = None) -> tuple[np.ndarray, float]:
+        feats = []
+        worst_err = 0.0
+        U = init_state
+
+        for t in range(len(x_seq)):
+            lags = [x_seq[t - l] if (t - l) >= 0 else x_seq[0] for l in range(self.num_lags)]
+            U, err = self._step(U, np.array(lags))
+            worst_err = max(worst_err, err)
+
+            psi = U[:self.grid.n]
+            phi = U[self.grid.n:]
+            prob_psi = (np.abs(psi) ** 2).reshape(self.pool_bins, -1).mean(axis=1)
+            prob_phi = (np.abs(phi) ** 2).reshape(self.pool_bins, -1).mean(axis=1)
+            feats.append(np.concatenate([prob_psi, prob_phi, [1.0]]))
+
+        self.last_state = U
+        return np.array(feats), worst_err
+
+    def fit(self, x_train: np.ndarray, y_train: np.ndarray):
+        F_tr, _ = self.transform(x_train)
+        F_valid = F_tr[self.washout:]
+        y_valid = y_train[self.washout:]
+
+        # Spectral SVD-Tikhonov solver (prevents condition-number divergence)
+        U_svd, S, Vt = np.linalg.svd(F_valid, full_matrices=False)
+        S_filter = S / (S ** 2 + self.ridge_lambda)
+        
+        # Hard thresholding of collinear modes
+        spectral_cutoff = S[0] * self.rcond
+        S_filter[S < spectral_cutoff] = 0.0
+
+        self.weights = Vt.T @ (S_filter * (U_svd.T @ y_valid))
+        return self
+
+    def predict(self, x_seq: np.ndarray, warm_start: bool = False) -> np.ndarray:
+        assert self.weights is not None, "Model must be fitted before predict"
+        init_state = self.last_state if warm_start else None
+        F, _ = self.transform(x_seq, init_state=init_state)
+        return F @ self.weights
