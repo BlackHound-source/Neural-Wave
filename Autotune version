@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""
+rcsnf.py - Recurrent Continuous Schrödinger Neural Field (R-CSNF).
+
+Pipeline features:
+  1. Lag window -> coherent wave-packet encoding on S^1 lattice (psi, phi).
+  2. Recurrent unitary evolution (Cayley-Crank-Nicolson scheme) with memory injection.
+  3. Pooled probability features from |psi|^2 and |phi|^2 with redundant-mode drop.
+  4. Centred SVD ridge readout with spectral truncation (rcond=1e-4).
+  5. Built-in validation auto-tuning engine with feature caching for fast evaluation.
+"""
+
+import itertools
+from dataclasses import dataclass
+
+import numpy as np
+
+TWO_PI = 2.0 * np.pi
+
+
+def softplus(z):
+    return np.logaddexp(0.0, z)
+
+
+class SpatialRingGrid:
+    """Periodic 1-D lattice on S^1 with a finite-difference Laplacian."""
+
+    def __init__(self, n=32, L=TWO_PI):
+        self.n = n
+        self.L = L
+        self.x = np.linspace(0.0, L, n, endpoint=False)
+        self.dx = L / n
+        shift_up = np.roll(np.eye(n), 1, axis=0)
+        shift_dn = np.roll(np.eye(n), -1, axis=0)
+        self.lap = (shift_up - 2.0 * np.eye(n) + shift_dn) / (self.dx ** 2)
+
+
+@dataclass
+class RecurrentWaveConfig:
+    z: np.ndarray
+    phase: np.ndarray
+    omegas: np.ndarray
+    omega_weights: np.ndarray
+    D_psi: float
+    D_phi: float
+    alpha_inject: float
+    V_amp_psi: float = 0.5
+    V_amp_phi: float = 0.5
+
+    def amplitude(self):
+        return softplus(self.z)
+
+    def copy(self):
+        return RecurrentWaveConfig(
+            self.z.copy(), self.phase.copy(), self.omegas.copy(),
+            self.omega_weights.copy(), float(self.D_psi), float(self.D_phi),
+            float(self.alpha_inject), float(self.V_amp_psi), float(self.V_amp_phi)
+        )
+
+
+def fit_readout(F, Y, lam=1e-4, rcond=1e-4):
+    """
+    SVD ridge readout with spectral truncation.
+    Filters singular values satisfying sigma_i / sigma_max <= rcond.
+    F and Y must already be centred.
+    """
+    U, S, Vt = np.linalg.svd(F, full_matrices=False)
+    S_filter = S / (S ** 2 + lam)
+    S_filter[S <= S[0] * rcond] = 0.0
+    return Vt.T @ (S_filter * (U.T @ Y))
+
+
+class RecurrentCSNF:
+    def __init__(self, grid_n=48, num_lags=3, packet_width=0.35, pool_bins=8,
+                 t_evolve=1.0, evolve_steps=20, tau=1.0, washout=30,
+                 ridge_lambda=1e-4, rcond=1e-4, cfg=None):
+        assert grid_n % pool_bins == 0, "grid_n must be divisible by pool_bins"
+        self.grid_n = grid_n
+        self.grid = SpatialRingGrid(n=grid_n)
+        self.num_lags = num_lags
+        self.packet_width = packet_width
+        self.pool_bins = pool_bins
+        self.t_evolve = t_evolve
+        self.evolve_steps = evolve_steps
+        self.tau = tau
+        self.washout = washout
+        self.ridge_lambda = ridge_lambda
+        self.rcond = rcond
+
+        if cfg is None:
+            self.cfg = RecurrentWaveConfig(
+                z=np.zeros(self.grid.n), phase=np.zeros(self.grid.n),
+                omegas=np.array([0.5, 1.25, 2.75]),
+                omega_weights=np.array([0.6, 0.3, 0.1]),
+                D_psi=0.25, D_phi=0.25, alpha_inject=0.60,
+                V_amp_psi=0.4, V_amp_phi=0.4
+            )
+        else:
+            self.cfg = cfg.copy()
+
+        self.weights = None
+        self.f_mean = None
+        self.y_mean = None
+        self.last_state = None
+        self._build_static_operators()
+
+    def get_params(self):
+        """Extract tunable hyperparameters."""
+        return {
+            "grid_n": self.grid_n,
+            "packet_width": self.packet_width,
+            "pool_bins": self.pool_bins,
+            "ridge_lambda": self.ridge_lambda,
+            "rcond": self.rcond,
+            "alpha_inject": self.cfg.alpha_inject,
+            "D": self.cfg.D_psi,
+            "t_evolve": self.t_evolve,
+            "evolve_steps": self.evolve_steps,
+        }
+
+    def set_params(self, **params):
+        """Update hyperparameters and recompute operators if spatial/wave properties change."""
+        rebuild_grid = False
+        rebuild_ops = False
+
+        for key, val in params.items():
+            if key == "grid_n" and val != self.grid_n:
+                self.grid_n = val
+                rebuild_grid = True
+            elif key == "pool_bins":
+                self.pool_bins = val
+            elif key == "packet_width":
+                self.packet_width = val
+            elif key == "ridge_lambda":
+                self.ridge_lambda = val
+            elif key == "rcond":
+                self.rcond = val
+            elif key in ("alpha", "alpha_inject"):
+                self.cfg.alpha_inject = float(val)
+            elif key == "D":
+                self.cfg.D_psi = float(val)
+                self.cfg.D_phi = float(val)
+                rebuild_ops = True
+            elif key in ("D_psi", "D_phi"):
+                setattr(self.cfg, key, float(val))
+                rebuild_ops = True
+            elif key == "omegas":
+                self.cfg.omegas = np.asarray(val)
+                rebuild_ops = True
+            elif hasattr(self, key):
+                setattr(self, key, val)
+                rebuild_ops = True
+
+        if rebuild_grid:
+            assert self.grid_n % self.pool_bins == 0, "grid_n must be divisible by pool_bins"
+            self.grid = SpatialRingGrid(n=self.grid_n)
+            self.cfg.z = np.zeros(self.grid_n)
+            self.cfg.phase = np.zeros(self.grid_n)
+            rebuild_ops = True
+
+        if rebuild_ops:
+            self._build_static_operators()
+
+        return self
+
+    def _build_static_operators(self):
+        n = self.grid.n
+        x = self.grid.x
+        self._dt = self.t_evolve / self.evolve_steps
+        self._I2 = np.eye(2 * n, dtype=np.complex128)
+        V_psi = self.cfg.V_amp_psi * np.cos(2.0 * x)
+        V_phi = self.cfg.V_amp_phi * np.sin(3.0 * x)
+        H_psi = -self.cfg.D_psi * self.grid.lap + np.diag(V_psi)
+        H_phi = -self.cfg.D_phi * self.grid.lap + np.diag(V_phi)
+        self._H_base = np.block([[H_psi, np.zeros((n, n))],
+                                 [np.zeros((n, n)), H_phi]]).astype(np.complex128)
+        t_mid = (np.arange(self.evolve_steps) + 0.5) * self._dt
+        coup = np.zeros((self.evolve_steps, n), dtype=np.complex128)
+        for w, weight in zip(self.cfg.omegas, self.cfg.omega_weights):
+            coup += weight * np.exp(1j * (self.cfg.phase[None, :] - w * t_mid[:, None]))
+        self._coupling = coup
+
+    def _encode_lags(self, u_lags):
+        phi = np.zeros(self.grid.n, dtype=np.complex128)
+        psi = np.ones(self.grid.n, dtype=np.complex128) / np.sqrt(self.grid.n)
+        k = len(u_lags)
+        weights = np.exp(-0.35 * np.arange(k))
+        weights /= np.sum(weights)
+
+        if k > 1:
+            diff = u_lags[0] - u_lags[1]
+            velocity = np.arctan2(np.sin(diff), np.cos(diff))
+        else:
+            velocity = 0.0
+
+        for i, val in enumerate(u_lags):
+            center = self.grid.L * (0.15 + 0.70 * np.clip(val, 0.0, 1.0) + (i * 0.15)) % self.grid.L
+            d = np.angle(np.exp(1j * (self.grid.x - center)))
+            packet = np.exp(-0.5 * (d / max(self.packet_width, 1e-4)) ** 2)
+            phase_tilt = np.exp(1j * (velocity * (i + 1) * np.pi * self.grid.x / self.grid.L))
+            phi += weights[i] * packet.astype(np.complex128) * phase_tilt
+
+        norm = np.sqrt(max(np.vdot(psi, psi).real + np.vdot(phi, phi).real, 1e-12))
+        return psi / norm, phi / norm
+
+    def _step(self, prev_U, u_lags, record=None):
+        n = self.grid.n
+        a = self.cfg.amplitude()
+
+        psi_inj, phi_inj = self._encode_lags(u_lags)
+        U_inj = np.concatenate([psi_inj, phi_inj]).astype(np.complex128)
+        if record is not None:
+            record.append(("inject", U_inj.copy(), -1))
+
+        if prev_U is None:
+            U = U_inj
+        else:
+            U = (1.0 - self.cfg.alpha_inject) * prev_U + self.cfg.alpha_inject * U_inj
+            U = U / np.sqrt(max(np.vdot(U, U).real, 1e-12))
+        norm0 = np.vdot(U, U).real
+
+        half = 0.5j * self._dt / self.tau
+        for k_idx in range(self.evolve_steps):
+            J = np.diag(a * self._coupling[k_idx])
+            H = self._H_base.copy()
+            H[:n, n:] = J
+            H[n:, :n] = J.conj().T
+            lhs = self._I2 + half * H
+            rhs = self._I2 - half * H
+            U = np.linalg.solve(lhs, rhs @ U)
+            if record is not None:
+                record.append(("evolve", U.copy(), k_idx))
+
+        norm_err = abs(np.vdot(U, U).real - norm0) / max(norm0, 1e-12)
+        return U, norm_err
+
+    def _features(self, U):
+        n = self.grid.n
+        pb = (np.abs(U[:n]) ** 2).reshape(self.pool_bins, -1).mean(axis=1)
+        pp = (np.abs(U[n:]) ** 2).reshape(self.pool_bins, -1).mean(axis=1)
+        return np.concatenate([pb, pp[:-1]])
+
+    def transform(self, x_seq, init_state=None, record=None):
+        feats = []
+        worst_err = 0.0
+        U = init_state
+        for t in range(len(x_seq)):
+            lags = [x_seq[t - l] if (t - l) >= 0 else x_seq[0] for l in range(self.num_lags)]
+            U, err = self._step(U, np.array(lags), record=record)
+            worst_err = max(worst_err, err)
+            feats.append(self._features(U))
+        self.last_state = U
+        return np.array(feats), worst_err
+
+    def fit(self, x_train, y_train):
+        F, _ = self.transform(x_train)
+        F = F[self.washout:]
+        Y = y_train[self.washout:]
+        self.f_mean = F.mean(axis=0)
+        self.y_mean = Y.mean(axis=0)
+        self.weights = fit_readout(F - self.f_mean, Y - self.y_mean,
+                                   lam=self.ridge_lambda, rcond=self.rcond)
+        return self
+
+    def predict(self, x_seq, warm_start=False, warm_x=None):
+        assert self.weights is not None, "Model must be fitted before predict"
+        if warm_x is not None:
+            full = np.concatenate([warm_x, x_seq])
+            F, _ = self.transform(full, init_state=None)
+            F = F[len(warm_x):]
+        else:
+            init_state = self.last_state if warm_start else None
+            F, _ = self.transform(x_seq, init_state=init_state)
+        return (F - self.f_mean) @ self.weights + self.y_mean
+
+    def fit_tune(self, x_tr, y_tr, x_va, y_va, warm_va, param_grid, metric_fn=None):
+        """
+        Auto-tune hyperparameters over a validation split.
+        Caches feature transforms if only linear readout parameters (ridge_lambda, rcond) vary.
+        """
+        if metric_fn is None:
+            metric_fn = lambda y, yhat: np.sqrt(np.mean((y - yhat) ** 2)) / (np.std(y) + 1e-12)
+
+        keys = list(param_grid.keys())
+        combinations = [dict(zip(keys, v)) for v in itertools.product(*param_grid.values())]
+
+        best_params = None
+        best_score = np.inf
+        field_keys = {"grid_n", "packet_width", "pool_bins", "alpha", "alpha_inject", "D", "t_evolve"}
+
+        # Check if wave field parameters are fixed
+        only_readout = all(len(field_keys.intersection(comb.keys())) == 0 for comb in combinations)
+
+        if only_readout:
+            # Single wave-field forward pass; grid search over SVD filter cutoffs and ridge penalties
+            F_tr, _ = self.transform(x_tr)
+            F_tr = F_tr[self.washout:]
+            Y_tr = y_tr[self.washout:]
+            f_mean = F_tr.mean(axis=0)
+            y_mean = Y_tr.mean(axis=0)
+            F_tr_c = F_tr - f_mean
+            Y_tr_c = Y_tr - y_mean
+
+            full_va = np.concatenate([warm_va, x_va])
+            F_va_full, _ = self.transform(full_va)
+            F_va = F_va_full[len(warm_va):]
+            F_va_c = F_va - f_mean
+
+            U, S, Vt = np.linalg.svd(F_tr_c, full_matrices=False)
+            UtY = U.T @ Y_tr_c
+
+            for p in combinations:
+                lam = p.get("ridge_lambda", p.get("ridge", self.ridge_lambda))
+                rc = p.get("rcond", self.rcond)
+                S_filter = S / (S ** 2 + lam)
+                S_filter[S <= S[0] * rc] = 0.0
+                w = Vt.T @ (S_filter * UtY)
+
+                yhat_va = F_va_c @ w + y_mean
+                score = metric_fn(y_va, yhat_va)
+
+                if np.isfinite(score) and score < best_score:
+                    best_score = score
+                    best_params = p
+        else:
+            # Full grid evaluation across field parameters
+            for p in combinations:
+                self.set_params(**p)
+                self.fit(x_tr, y_tr)
+                yhat_va = self.predict(x_va, warm_x=warm_va)
+                score = metric_fn(y_va, yhat_va)
+
+                if np.isfinite(score) and score < best_score:
+                    best_score = score
+                    best_params = p
+
+        # Finalize instance on the best identified configuration
+        if best_params is not None:
+            self.set_params(**best_params)
+            self.fit(x_tr, y_tr)
+
+        return best_params, best_score
