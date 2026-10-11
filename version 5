@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+rcsnf.py - Recurrent Continuous Schrodinger Neural Field (R-CSNF), algorithm only.
+
+Forecasting pipeline:
+  1. Lag window -> coherent wave-packet encoding on a periodic ring (psi, phi).
+  2. Recurrent unitary evolution (Cayley scheme) with memory injection.
+  3. Pooled probability features from |psi|^2 and |phi|^2.
+     Unitarity makes sum(pooled psi) + sum(pooled phi) = pool_bins / grid_n for
+     every step, so the last phi bin is an exact linear function of the others and is
+     dropped.
+  4. Centred SVD ridge readout (feature and target means are learned on the
+     training part only).
+"""
+
+from dataclasses import dataclass
+
+import numpy as np
+
+TWO_PI = 2.0 * np.pi
+
+
+def softplus(z):
+    return np.logaddexp(0.0, z)
+
+
+class SpatialRingGrid:
+    """Periodic 1-D lattice on S^1 with a finite-difference Laplacian."""
+
+    def __init__(self, n=32, L=TWO_PI):
+        self.n = n
+        self.L = L
+        self.x = np.linspace(0.0, L, n, endpoint=False)
+        self.dx = L / n
+        shift_up = np.roll(np.eye(n), 1, axis=0)
+        shift_dn = np.roll(np.eye(n), -1, axis=0)
+        self.lap = (shift_up - 2.0 * np.eye(n) + shift_dn) / (self.dx ** 2)
+
+
+@dataclass
+class RecurrentWaveConfig:
+    z: np.ndarray
+    phase: np.ndarray
+    omegas: np.ndarray
+    omega_weights: np.ndarray
+    D_psi: float
+    D_phi: float
+    alpha_inject: float
+    V_amp_psi: float = 0.5
+    V_amp_phi: float = 0.5
+
+    def amplitude(self):
+        return softplus(self.z)
+
+    def copy(self):
+        return RecurrentWaveConfig(
+            self.z.copy(), self.phase.copy(), self.omegas.copy(),
+            self.omega_weights.copy(), float(self.D_psi), float(self.D_phi),
+            float(self.alpha_inject), float(self.V_amp_psi), float(self.V_amp_phi))
+
+
+def fit_readout(F, Y, lam=1e-4, rcond=1e-5):
+    """
+    SVD ridge readout with spectral truncation.
+    W = V diag(S / (S^2 + lam)) U^T Y equals (F^T F + lam I)^{-1} F^T Y without
+    forming F^T F. Singular values below rcond * S_max are dropped.
+    F and Y should already be centred.
+    """
+    U, S, Vt = np.linalg.svd(F, full_matrices=False)
+    S_filter = S / (S ** 2 + lam)
+    S_filter[S <= S[0] * rcond] = 0.0
+    return Vt.T @ (S_filter * (U.T @ Y))
+
+
+class RecurrentCSNF:
+    def __init__(self, grid_n=48, num_lags=3, packet_width=0.35, pool_bins=8,
+                 t_evolve=1.0, evolve_steps=20, tau=1.0, washout=30,
+                 ridge_lambda=1e-4, cfg=None):
+        assert grid_n % pool_bins == 0, "grid_n must be divisible by pool_bins"
+        self.grid = SpatialRingGrid(n=grid_n)
+        self.num_lags = num_lags
+        self.packet_width = packet_width
+        self.pool_bins = pool_bins
+        self.t_evolve = t_evolve
+        self.evolve_steps = evolve_steps
+        self.tau = tau
+        self.washout = washout
+        self.ridge_lambda = ridge_lambda
+        if cfg is None:
+            self.cfg = RecurrentWaveConfig(
+                z=np.zeros(self.grid.n), phase=np.zeros(self.grid.n),
+                omegas=np.array([0.5, 1.25, 2.75]),
+                omega_weights=np.array([0.6, 0.3, 0.1]),
+                D_psi=0.25, D_phi=0.25, alpha_inject=0.60,
+                V_amp_psi=0.4, V_amp_phi=0.4)
+        else:
+            self.cfg = cfg.copy()
+        self.weights = None
+        self.f_mean = None
+        self.y_mean = None
+        self.last_state = None
+        self._build_static_operators()
+
+    def _build_static_operators(self):
+        """Input-independent operators, built once."""
+        n = self.grid.n
+        x = self.grid.x
+        self._dt = self.t_evolve / self.evolve_steps
+        self._I2 = np.eye(2 * n, dtype=np.complex128)
+        V_psi = self.cfg.V_amp_psi * np.cos(2.0 * x)
+        V_phi = self.cfg.V_amp_phi * np.sin(3.0 * x)
+        H_psi = -self.cfg.D_psi * self.grid.lap + np.diag(V_psi)
+        H_phi = -self.cfg.D_phi * self.grid.lap + np.diag(V_phi)
+        self._H_base = np.block([[H_psi, np.zeros((n, n))],
+                                 [np.zeros((n, n)), H_phi]]).astype(np.complex128)
+        t_mid = (np.arange(self.evolve_steps) + 0.5) * self._dt
+        coup = np.zeros((self.evolve_steps, n), dtype=np.complex128)
+        for w, weight in zip(self.cfg.omegas, self.cfg.omega_weights):
+            coup += weight * np.exp(1j * (self.cfg.phase[None, :] - w * t_mid[:, None]))
+        self._coupling = coup
+
+    def _encode_lags(self, u_lags):
+        """Encode a lag window as a wave packet superposition on the ring."""
+        phi = np.zeros(self.grid.n, dtype=np.complex128)
+        psi = np.ones(self.grid.n, dtype=np.complex128) / np.sqrt(self.grid.n)
+        k = len(u_lags)
+        weights = np.exp(-0.35 * np.arange(k))
+        weights /= np.sum(weights)
+        # Geodesic difference on the circle (shortest signed arc).
+        if k > 1:
+            diff = u_lags[0] - u_lags[1]
+            velocity = np.arctan2(np.sin(diff), np.cos(diff))
+        else:
+            velocity = 0.0
+        for i, val in enumerate(u_lags):
+            center = self.grid.L * (0.15 + 0.70 * np.clip(val, 0.0, 1.0) + (i * 0.15)) % self.grid.L
+            d = np.angle(np.exp(1j * (self.grid.x - center)))
+            packet = np.exp(-0.5 * (d / max(self.packet_width, 1e-4)) ** 2)
+            phase_tilt = np.exp(1j * (velocity * (i + 1) * np.pi * self.grid.x / self.grid.L))
+            phi += weights[i] * packet.astype(np.complex128) * phase_tilt
+        norm = np.sqrt(max(np.vdot(psi, psi).real + np.vdot(phi, phi).real, 1e-12))
+        return psi / norm, phi / norm
+
+    def _step(self, prev_U, u_lags, record=None):
+        """One recurrent step. If `record` is a list, snapshots are appended."""
+        n = self.grid.n
+        a = self.cfg.amplitude()
+
+        psi_inj, phi_inj = self._encode_lags(u_lags)
+        U_inj = np.concatenate([psi_inj, phi_inj]).astype(np.complex128)
+        if record is not None:
+            record.append(("inject", U_inj.copy(), -1))
+
+        if prev_U is None:
+            U = U_inj
+        else:
+            U = (1.0 - self.cfg.alpha_inject) * prev_U + self.cfg.alpha_inject * U_inj
+            U = U / np.sqrt(max(np.vdot(U, U).real, 1e-12))
+        norm0 = np.vdot(U, U).real
+
+        half = 0.5j * self._dt / self.tau
+        for k_idx in range(self.evolve_steps):
+            J = np.diag(a * self._coupling[k_idx])
+            H = self._H_base.copy()
+            H[:n, n:] = J
+            H[n:, :n] = J.conj().T
+            lhs = self._I2 + half * H
+            rhs = self._I2 - half * H
+            U = np.linalg.solve(lhs, rhs @ U)
+            if record is not None:
+                record.append(("evolve", U.copy(), k_idx))
+
+        norm_err = abs(np.vdot(U, U).real - norm0) / max(norm0, 1e-12)
+        return U, norm_err
+
+    def _features(self, U):
+        """Pooled probabilities. The last phi bin is dropped (see module docstring)."""
+        n = self.grid.n
+        pb = (np.abs(U[:n]) ** 2).reshape(self.pool_bins, -1).mean(axis=1)
+        pp = (np.abs(U[n:]) ** 2).reshape(self.pool_bins, -1).mean(axis=1)
+        return np.concatenate([pb, pp[:-1]])
+
+    def transform(self, x_seq, init_state=None, record=None):
+        feats = []
+        worst_err = 0.0
+        U = init_state
+        for t in range(len(x_seq)):
+            lags = [x_seq[t - l] if (t - l) >= 0 else x_seq[0] for l in range(self.num_lags)]
+            U, err = self._step(U, np.array(lags), record=record)
+            worst_err = max(worst_err, err)
+            feats.append(self._features(U))
+        self.last_state = U
+        return np.array(feats), worst_err
+
+    def fit(self, x_train, y_train):
+        F, _ = self.transform(x_train)
+        F = F[self.washout:]
+        Y = y_train[self.washout:]
+        self.f_mean = F.mean(axis=0)
+        self.y_mean = Y.mean(axis=0)
+        self.weights = fit_readout(F - self.f_mean, Y - self.y_mean, lam=self.ridge_lambda)
+        return self
+
+    def predict(self, x_seq, warm_start=False):
+        assert self.weights is not None, "Model must be fitted before predict"
+        init_state = self.last_state if warm_start else None
+        F, _ = self.transform(x_seq, init_state=init_state)
+        return (F - self.f_mean) @ self.weights + self.y_mean
