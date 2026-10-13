@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""
+rcsnf.py - Recurrent Continuous Schrödinger Neural Field (R-CSNF v3) with fail-safes.
+Algorithm only. Supports configurable input and output dimensions.
+"""
+
+from dataclasses import dataclass
+import itertools
+import numpy as np
+
+TWO_PI = 2.0 * np.pi
+
+
+def softplus(z):
+    z_clean = np.nan_to_num(z, nan=0.0, posinf=50.0, neginf=-50.0)
+    return np.logaddexp(0.0, z_clean)
+
+
+class SpectralRingGrid:
+    """Periodic 1-D lattice on S^1 with exact Fourier wavenumbers."""
+
+    def __init__(self, n=64, L=TWO_PI):
+        self.n = n
+        self.L = L
+        self.x = np.linspace(0.0, L, n, endpoint=False)
+        self.dx = L / n
+        self.k = 2.0 * np.pi * np.fft.fftfreq(n, d=self.dx)
+        self.k_sq = self.k ** 2
+
+
+@dataclass
+class RecurrentWaveConfig:
+    z: np.ndarray
+    phase: np.ndarray
+    omegas: np.ndarray
+    omega_weights: np.ndarray
+    D_psi: float
+    D_phi: float
+    alpha_inject: float
+    V_amp_psi: float = 0.5
+    V_amp_phi: float = 0.5
+
+    def amplitude(self):
+        return softplus(self.z)
+
+    def copy(self):
+        return RecurrentWaveConfig(
+            self.z.copy(), self.phase.copy(), self.omegas.copy(),
+            self.omega_weights.copy(), float(self.D_psi), float(self.D_phi),
+            float(self.alpha_inject), float(self.V_amp_psi), float(self.V_amp_phi)
+        )
+
+
+def fit_readout(F, Y, lam=1e-4, rcond=1e-4):
+    """SVD ridge readout with spectral truncation and numerical guards."""
+    if not (np.all(np.isfinite(F)) and np.all(np.isfinite(Y))):
+        F = np.nan_to_num(F, nan=0.0, posinf=1.0, neginf=-1.0)
+        Y = np.nan_to_num(Y, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    try:
+        U, S, Vt = np.linalg.svd(F, full_matrices=False)
+    except np.linalg.LinAlgError:
+        n_features = F.shape[1]
+        reg = lam * np.eye(n_features)
+        return np.linalg.solve(F.T @ F + reg, F.T @ Y)
+
+    S_filter = S / (S ** 2 + lam)
+    cutoff = S[0] * rcond if len(S) > 0 and np.isfinite(S[0]) else 1e-12
+    S_filter[S <= cutoff] = 0.0
+    return Vt.T @ (S_filter * (U.T @ Y))
+
+
+class RecurrentCSNF:
+    def __init__(self, grid_n=64, input_dim=1, output_dim=None, num_lags=3,
+                 packet_width=0.35, pool_bins=8, t_evolve=1.0, evolve_steps=10,
+                 tau=1.0, washout=30, ridge_lambda=1e-4, rcond=1e-4, cfg=None):
+        assert grid_n % pool_bins == 0, "grid_n must be divisible by pool_bins"
+        assert input_dim >= 1, "input_dim must be at least 1"
+        self.grid_n = grid_n
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.grid = SpectralRingGrid(n=grid_n)
+        self.num_lags = num_lags
+        self.packet_width = packet_width
+        self.pool_bins = pool_bins
+        self.t_evolve = t_evolve
+        self.evolve_steps = evolve_steps
+        self.tau = tau
+        self.washout = washout
+        self.ridge_lambda = ridge_lambda
+        self.rcond = rcond
+
+        if cfg is None:
+            self.cfg = RecurrentWaveConfig(
+                z=np.zeros(self.grid.n),
+                phase=np.zeros(self.grid.n),
+                omegas=np.array([0.5, 1.25, 2.75]),
+                omega_weights=np.array([0.6, 0.3, 0.1]),
+                D_psi=0.01, D_phi=0.01, alpha_inject=0.60,
+                V_amp_psi=0.4, V_amp_phi=0.4
+            )
+        else:
+            self.cfg = cfg.copy()
+
+        self.weights = None
+        self.f_mean = None
+        self.y_mean = None
+        self.last_state = None
+        self._build_static_operators()
+
+    def set_params(self, **params):
+        rebuild_grid = False
+        rebuild_ops = False
+        for key, val in params.items():
+            if key == "grid_n" and val != self.grid_n:
+                self.grid_n = val
+                rebuild_grid = True
+            elif key == "input_dim":
+                assert val >= 1, "input_dim must be at least 1"
+                self.input_dim = val
+            elif key == "output_dim":
+                self.output_dim = val
+            elif key == "pool_bins":
+                self.pool_bins = val
+            elif key == "packet_width":
+                self.packet_width = val
+            elif key == "ridge_lambda":
+                self.ridge_lambda = val
+            elif key == "rcond":
+                self.rcond = val
+            elif key in ("alpha", "alpha_inject"):
+                self.cfg.alpha_inject = float(val)
+            elif key == "D":
+                self.cfg.D_psi = float(val)
+                self.cfg.D_phi = float(val)
+                rebuild_ops = True
+            elif key in ("D_psi", "D_phi"):
+                setattr(self.cfg, key, float(val))
+                rebuild_ops = True
+            elif key == "omegas":
+                self.cfg.omegas = np.asarray(val)
+                rebuild_ops = True
+            elif hasattr(self, key):
+                setattr(self, key, val)
+                rebuild_ops = True
+
+        if rebuild_grid:
+            assert self.grid_n % self.pool_bins == 0
+            self.grid = SpectralRingGrid(n=self.grid_n)
+            self.cfg.z = np.zeros(self.grid_n)
+            self.cfg.phase = np.zeros(self.grid_n)
+            rebuild_ops = True
+        if rebuild_ops:
+            self._build_static_operators()
+        return self
+
+    def _build_static_operators(self):
+        n = self.grid.n
+        x = self.grid.x
+        self._dt = self.t_evolve / self.evolve_steps
+        sub_dt = self._dt / self.tau
+
+        self._prop_kinetic_psi = np.exp(-0.5j * self.cfg.D_psi * self.grid.k_sq * sub_dt)
+        self._prop_kinetic_phi = np.exp(-0.5j * self.cfg.D_phi * self.grid.k_sq * sub_dt)
+
+        self._V_psi = self.cfg.V_amp_psi * np.cos(2.0 * x)
+        self._V_phi = self.cfg.V_amp_phi * np.sin(3.0 * x)
+
+        t_mid = (np.arange(self.evolve_steps) + 0.5) * self._dt
+        coup = np.zeros((self.evolve_steps, n), dtype=np.complex128)
+        for w, weight in zip(self.cfg.omegas, self.cfg.omega_weights):
+            coup += weight * np.exp(1j * (self.cfg.phase[None, :] - w * t_mid[:, None]))
+        self._coupling = coup
+
+    def _safe_normalize(self, psi, phi):
+        norm_sq = np.vdot(psi, psi).real + np.vdot(phi, phi).real
+        if not np.isfinite(norm_sq) or norm_sq < 1e-12:
+            psi = np.ones(self.grid.n, dtype=np.complex128) / np.sqrt(self.grid.n)
+            phi = np.zeros(self.grid.n, dtype=np.complex128)
+            return psi, phi, 1.0
+        norm = np.sqrt(norm_sq)
+        return psi / norm, phi / norm, norm
+
+    def _encode_lags(self, u_lags):
+        """
+        u_lags: array of shape (num_lags, input_dim). A 1-D array is treated
+        as (num_lags, 1) for backward compatibility with scalar series.
+        """
+        u_clean = np.asarray(u_lags, dtype=float)
+        if u_clean.ndim == 1:
+            u_clean = u_clean[:, None]
+        if u_clean.shape[1] != self.input_dim:
+            raise ValueError(
+                f"Expected {self.input_dim} input features, "
+                f"received {u_clean.shape[1]}"
+            )
+        u_clean = np.nan_to_num(u_clean, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        phi = np.zeros(self.grid.n, dtype=np.complex128)
+        psi = np.ones(self.grid.n, dtype=np.complex128) / np.sqrt(self.grid.n)
+        k = u_clean.shape[0]
+        weights = np.exp(-0.35 * np.arange(k))
+        weights /= np.sum(weights)
+
+        # Velocity from the first two lags, per feature (phase tilt).
+        if k > 1:
+            diff = u_clean[0] - u_clean[1]
+        else:
+            diff = np.zeros(self.input_dim)
+        velocity = np.arctan2(np.sin(diff), np.cos(diff))
+
+        for i in range(k):
+            for f in range(self.input_dim):
+                val = u_clean[i, f]
+                # Separate input features occupy distinct phase regions.
+                center = self.grid.L * (
+                    0.15 + 0.70 * np.clip(val, 0.0, 1.0)
+                    + (i * 0.15) + f / max(self.input_dim, 1)
+                ) % self.grid.L
+                d = np.angle(np.exp(1j * (self.grid.x - center)))
+                packet = np.exp(-0.5 * (d / max(self.packet_width, 1e-4)) ** 2)
+                phase_tilt = np.exp(
+                    1j * (velocity[f] * (i + 1) * np.pi * self.grid.x / self.grid.L)
+                )
+                phi += (weights[i] / self.input_dim) * packet.astype(np.complex128) * phase_tilt
+
+        psi, phi, _ = self._safe_normalize(psi, phi)
+        return psi, phi
+
+    def _step(self, prev_U, u_lags):
+        n = self.grid.n
+        psi_inj, phi_inj = self._encode_lags(u_lags)
+        sub_dt = self._dt / self.tau
+        a = self.cfg.amplitude()
+
+        if prev_U is None:
+            psi, phi = psi_inj, phi_inj
+            norm0 = 1.0
+        else:
+            prev_psi, prev_phi = prev_U[:n], prev_U[n:]
+            phase_kick_psi = self.cfg.alpha_inject * np.angle(psi_inj + 1e-12)
+            phase_kick_phi = self.cfg.alpha_inject * np.angle(phi_inj + 1e-12)
+
+            psi = (prev_psi * (1.0 - 0.5 * self.cfg.alpha_inject) +
+                   psi_inj * 0.5 * self.cfg.alpha_inject) * np.exp(1j * phase_kick_psi)
+            phi = (prev_phi * (1.0 - 0.5 * self.cfg.alpha_inject) +
+                   phi_inj * 0.5 * self.cfg.alpha_inject) * np.exp(1j * phase_kick_phi)
+            psi, phi, norm0 = self._safe_normalize(psi, phi)
+
+        for k_idx in range(self.evolve_steps):
+            psi = np.fft.ifft(np.fft.fft(psi) * self._prop_kinetic_psi)
+            phi = np.fft.ifft(np.fft.fft(phi) * self._prop_kinetic_phi)
+
+            V_psi_local = self._V_psi * sub_dt
+            V_phi_local = self._V_phi * sub_dt
+            c_val = a * self._coupling[k_idx] * sub_dt
+            c_mag = np.abs(c_val)
+
+            exp_diag_psi = np.exp(-1j * V_psi_local)
+            exp_diag_phi = np.exp(-1j * V_phi_local)
+
+            psi = psi * exp_diag_psi - 1j * np.sin(c_mag) * (c_val / (c_mag + 1e-12)) * phi
+            phi = phi * exp_diag_phi - 1j * np.sin(c_mag) * (np.conj(c_val) / (c_mag + 1e-12)) * psi
+
+            psi = np.fft.ifft(np.fft.fft(psi) * self._prop_kinetic_psi)
+            phi = np.fft.ifft(np.fft.fft(phi) * self._prop_kinetic_phi)
+
+        psi, phi, norm_final = self._safe_normalize(psi, phi)
+        norm_err = abs(norm_final - norm0) / max(norm0, 1e-12)
+        return np.concatenate([psi, phi]), norm_err
+
+    def _features(self, U, lags):
+        n = self.grid.n
+        psi, phi = U[:n], U[n:]
+
+        p_psi = (np.abs(psi) ** 2).reshape(self.pool_bins, -1).mean(axis=1)
+        p_phi = (np.abs(phi) ** 2).reshape(self.pool_bins, -1).mean(axis=1)
+
+        re_psi = psi.real.reshape(self.pool_bins, -1).mean(axis=1)
+        im_psi = psi.imag.reshape(self.pool_bins, -1).mean(axis=1)
+        re_phi = phi.real.reshape(self.pool_bins, -1).mean(axis=1)
+        im_phi = phi.imag.reshape(self.pool_bins, -1).mean(axis=1)
+
+        d_psi = np.fft.ifft(1j * self.grid.k * np.fft.fft(psi))
+        flux_psi = np.imag(np.conj(psi) * d_psi).reshape(self.pool_bins, -1).mean(axis=1)
+
+        # Flatten the (num_lags, input_dim) matrix so the readout can
+        # distinguish individual variables at each lag.
+        lags_clean = np.nan_to_num(
+            np.asarray(lags), nan=0.0, posinf=1.0, neginf=-1.0
+        ).reshape(-1)
+        feats = np.concatenate([p_psi, p_phi[:-1], re_psi, im_psi, re_phi, im_phi, flux_psi, lags_clean])
+        return np.nan_to_num(feats, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    def _build_lag_matrix(self, x_clean, t):
+        """Return (num_lags, input_dim) matrix of lagged inputs at time t."""
+        rows = []
+        for lag in range(self.num_lags):
+            idx = t - lag if (t - lag) >= 0 else 0
+            rows.append(x_clean[idx])
+        return np.stack(rows)
+
+    def transform(self, x_seq, init_state=None):
+        """
+        x_seq: (T,) or (T, input_dim). Returns features of shape (T, F) and worst norm error.
+        """
+        x_clean = np.asarray(x_seq, dtype=float)
+        if x_clean.ndim == 1:
+            x_clean = x_clean[:, None]
+        if x_clean.ndim != 2:
+            raise ValueError("Expected input shape (T,) or (T, input_dim)")
+        if x_clean.shape[1] != self.input_dim:
+            raise ValueError(
+                f"Expected {self.input_dim} features, received {x_clean.shape[1]}"
+            )
+        x_clean = np.nan_to_num(x_clean, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        feats = []
+        worst_err = 0.0
+        U = init_state
+        for t in range(len(x_clean)):
+            lags = self._build_lag_matrix(x_clean, t)
+            U, err = self._step(U, lags)
+            worst_err = max(worst_err, err if np.isfinite(err) else 0.0)
+            feats.append(self._features(U, lags))
+        self.last_state = U
+        return np.array(feats), worst_err
+
+    def _prepare_targets(self, y_train, n_samples):
+        Y = np.asarray(y_train, dtype=float)
+        if Y.ndim == 1:
+            Y = Y[:, None]
+        if Y.ndim != 2:
+            raise ValueError("Expected targets with shape (T,) or (T, output_dim)")
+        if len(Y) != n_samples:
+            raise ValueError("Input and target lengths must match")
+        if self.output_dim is not None and Y.shape[1] != self.output_dim:
+            raise ValueError(
+                f"Expected {self.output_dim} outputs, got {Y.shape[1]}"
+            )
+        self.output_dim = Y.shape[1]
+        return Y
+
+    def fit(self, x_train, y_train):
+        Y = self._prepare_targets(y_train, len(np.asarray(x_train)))
+        F, _ = self.transform(x_train)
+        F = F[self.washout:]
+        Y = Y[self.washout:]
+        self.f_mean = np.nan_to_num(F.mean(axis=0), nan=0.0)
+        self.y_mean = np.nan_to_num(Y.mean(axis=0), nan=0.0)
+        self.weights = fit_readout(F - self.f_mean, Y - self.y_mean,
+                                   lam=self.ridge_lambda, rcond=self.rcond)
+        return self
+
+    def predict(self, x_seq, warm_x=None):
+        assert self.weights is not None, "Model must be fitted before calling predict"
+        if warm_x is not None:
+            full = np.concatenate([np.asarray(warm_x).reshape(len(warm_x), -1),
+                                   np.asarray(x_seq).reshape(len(x_seq), -1)])
+            F, _ = self.transform(full, init_state=None)
+            F = F[len(warm_x):]
+        else:
+            F, _ = self.transform(x_seq, init_state=self.last_state)
+        pred = (F - self.f_mean) @ self.weights + self.y_mean
+        pred = np.nan_to_num(pred, nan=0.0)
+        if self.output_dim == 1:
+            return pred[:, 0]
+        return pred
+
+    def fit_tune(self, x_tr, y_tr, x_va, y_va, warm_va, param_grid, metric_fn=None):
+        if metric_fn is None:
+            metric_fn = lambda y, yhat: np.sqrt(np.mean((y - yhat) ** 2)) / (np.std(y) + 1e-12)
+
+        keys = list(param_grid.keys())
+        combinations = [dict(zip(keys, v)) for v in itertools.product(*param_grid.values())]
+        best_params, best_score = None, np.inf
+
+        for p in combinations:
+            self.set_params(**p)
+            self.fit(x_tr, y_tr)
+            score = metric_fn(y_va, self.predict(x_va, warm_x=warm_va))
+            if np.isfinite(score) and score < best_score:
+                best_score, best_params = score, p
+
+        if best_params is not None:
+            self.set_params(**best_params)
+            self.fit(x_tr, y_tr)
+        return best_params, best_score
